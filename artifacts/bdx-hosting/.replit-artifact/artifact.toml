@@ -1,0 +1,18 @@
+kind = "web"
+previewPath = "/bdx"
+title = "BDX HOSTING"
+version = "1.0.0"
+id = "artifacts/bdx-hosting"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/bdx" ]
+localPort = 5000
+
+[services.development]
+run = "PORT=5000 BASE_PATH=/bdx python3 app.py"
+
+[services.env]
+PORT = "5000"
+BASE_PATH = "/bdx"

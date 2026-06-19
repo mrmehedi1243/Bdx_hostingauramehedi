@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BDX HOSTING — Admin</title>
+<link rel="stylesheet" href="{{ bp }}/static/css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+</head>
+<body>
+
+{% if page == "login" %}
+<!-- Admin Login -->
+<div class="auth-body" style="min-height:100vh;display:flex;align-items:center;justify-content:center;">
+<div class="login-wrap" style="width:100%;">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="logo-icon"><i class="fa-solid fa-shield-halved"></i></div>
+    </div>
+    <h1 class="login-title"><span class="white">BDX</span> <span class="blue">ADMIN</span></h1>
+    <p class="login-sub">Admin Control Panel</p>
+    {% if error %}
+    <div class="alert alert-error"><i class="fa fa-triangle-exclamation"></i> {{ error }}</div>
+    {% endif %}
+    <form method="POST" autocomplete="off">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" name="username" required autofocus>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" name="password" required>
+      </div>
+      <button type="submit" class="btn-login"><i class="fa fa-right-to-bracket"></i> Admin Login</button>
+    </form>
+    <a href="{{ bp }}/" class="admin-link" style="margin-top:12px;display:block;text-align:center;">Back to User Login</a>
+  </div>
+</div>
+</div>
+
+{% else %}
+<!-- Admin Dashboard -->
+<div class="panel-body" style="min-height:100vh;">
+
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="topbar-logo">
+      <div class="logo-icon sm"><i class="fa-solid fa-shield-halved"></i></div>
+      <span><span class="white">BDX</span> <span class="blue">ADMIN</span></span>
+    </div>
+    <span class="topbar-welcome">Logged in as: <b>{{ admin }}</b></span>
+  </div>
+  <a href="{{ bp }}/admin/logout" class="btn-logout"><i class="fa fa-right-from-bracket"></i> Logout</a>
+</header>
+
+<div class="main-wrap">
+  <!-- Create Panel -->
+  <div class="admin-section">
+    <h2 class="section-title"><i class="fa fa-plus-circle blue"></i> Create New Panel</h2>
+    <div class="create-form" id="create-form">
+      <div class="form-row">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="new-username" placeholder="e.g. user1">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="text" id="new-password" placeholder="e.g. pass123">
+        </div>
+        <div class="form-group">
+          <label>Days</label>
+          <input type="number" id="new-days" value="15" min="1">
+        </div>
+        <div class="form-group">
+          <label>RAM (MB)</label>
+          <input type="number" id="new-ram" value="512" min="128">
+        </div>
+        <div class="form-group">
+          <label>Disk (MB)</label>
+          <input type="number" id="new-disk" value="1024" min="256">
+        </div>
+        <div class="form-group">
+          <label>Start Command</label>
+          <input type="text" id="new-cmd" value="python main.py">
+        </div>
+      </div>
+      <button class="btn-primary" onclick="createPanel()">
+        <i class="fa fa-plus"></i> Create Panel
+      </button>
+      <div id="create-result" class="create-result"></div>
+    </div>
+  </div>
+
+  <!-- Panel list -->
+  <div class="admin-section">
+    <h2 class="section-title"><i class="fa fa-list blue"></i> All Panels ({{ panels|length }})</h2>
+    {% if panels %}
+    <div class="table-wrap">
+    <table class="admin-table">
+      <thead>
+        <tr>
+          <th>Username</th>
+          <th>Server ID</th>
+          <th>Status</th>
+          <th>Expires</th>
+          <th>RAM</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in panels %}
+        <tr id="row-{{ p.id }}">
+          <td><b>{{ p.username }}</b></td>
+          <td class="blue mono">{{ p.server_id }}</td>
+          <td>
+            {% if p.runtime_status == 'running' %}
+            <span class="badge badge-green">RUNNING</span>
+            {% else %}
+            <span class="badge badge-gray">STOPPED</span>
+            {% endif %}
+          </td>
+          <td class="yellow">{{ p.expires_at[:10] }}</td>
+          <td>{{ p.ram_limit }}MB</td>
+          <td class="action-td">
+            <button class="btn-sm btn-extend" onclick="extendPanel('{{ p.id }}')">
+              <i class="fa fa-clock"></i> +15d
+            </button>
+            <button class="btn-sm btn-del" onclick="deletePanel('{{ p.id }}', '{{ p.username }}')">
+              <i class="fa fa-trash"></i>
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <div class="empty-state"><i class="fa fa-inbox"></i><br>No panels yet.</div>
+    {% endif %}
+  </div>
+
+  <!-- Bot API info -->
+  <div class="admin-section">
+    <h2 class="section-title"><i class="fa fa-robot blue"></i> Telegram Bot API</h2>
+    <div class="api-docs">
+      <p>Use these endpoints in your Telegram bot. Set header <code>X-Bot-Secret: bdx-bot-secret-key</code></p>
+      <div class="api-endpoint">
+        <span class="method post">POST</span>
+        <code>{{ bp }}/api/bot/create</code>
+        <pre class="api-body">{
+  "username": "user1",
+  "password": "pass123",
+  "days": 15,
+  "ram": 512,
+  "disk": 1024
+}</pre>
+      </div>
+      <div class="api-endpoint">
+        <span class="method get">GET</span>
+        <code>{{ bp }}/api/bot/panels</code>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main-wrap -->
+
+<script>
+const BP = "{{ bp }}";
+
+async function createPanel() {
+  const data = {
+    username: document.getElementById('new-username').value.trim(),
+    password: document.getElementById('new-password').value.trim(),
+    days:     parseInt(document.getElementById('new-days').value) || 15,
+    ram:      parseInt(document.getElementById('new-ram').value) || 512,
+    disk:     parseInt(document.getElementById('new-disk').value) || 1024,
+    start_command: document.getElementById('new-cmd').value.trim()
+  };
+  if (!data.username || !data.password) {
+    showResult('Username and password required', 'error'); return;
+  }
+  const res = await fetch(BP + '/admin/create', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data)
+  });
+  const j = await res.json();
+  if (j.ok) {
+    showResult(`Panel created! Username: <b>${j.username}</b> | Password: <b>${j.password}</b> | Server: <b>${j.server_id}</b> | Expires: <b>${j.expires}</b>`, 'success');
+    setTimeout(() => location.reload(), 2500);
+  } else {
+    showResult(j.msg, 'error');
+  }
+}
+
+function showResult(msg, type) {
+  const el = document.getElementById('create-result');
+  el.innerHTML = msg; el.className = 'create-result ' + type;
+}
+
+async function deletePanel(id, username) {
+  if (!confirm(`Delete panel for "${username}"? This cannot be undone.`)) return;
+  const res = await fetch(BP + '/admin/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({panel_id: id})
+  });
+  const j = await res.json();
+  if (j.ok) { document.getElementById('row-' + id)?.remove(); }
+  else { alert(j.msg); }
+}
+
+async function extendPanel(id) {
+  const days = prompt('Extend by how many days?', '15');
+  if (!days) return;
+  const res = await fetch(BP + '/admin/extend', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({panel_id: id, days: parseInt(days)})
+  });
+  const j = await res.json();
+  if (j.ok) { alert(`Extended! New expiry: ${j.expires}`); location.reload(); }
+  else { alert(j.msg); }
+}
+</script>
+
+{% endif %}
+
+</body>
+</html>
