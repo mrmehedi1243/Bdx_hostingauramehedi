@@ -109,8 +109,11 @@ def proc_stats(pid):
     info = PROCESSES.get(pid)
     if not info: return {"status":"stopped","uptime":"0m 0s","cpu":"0.0","ram":"0"}
     try:
-        p   = psutil.Process(info["proc"].pid)
-        cpu = p.cpu_percent(interval=0.1)
+        p = psutil.Process(info["proc"].pid)
+        if "psutil_handle" not in info or info.get("psutil_pid") != p.pid:
+            p.cpu_percent(interval=None)  # prime the internal counter, non-blocking
+            info["psutil_handle"] = p; info["psutil_pid"] = p.pid
+        cpu = info["psutil_handle"].cpu_percent(interval=None)  # non-blocking, delta since last call
         ram = int(p.memory_info().rss/1024/1024)
         return {"status":"running","uptime":fmt_up(time.time()-info["start_time"]),"cpu":f"{cpu:.1f}","ram":str(ram)}
     except: return {"status":"stopped","uptime":"0m 0s","cpu":"0.0","ram":"0"}
@@ -179,6 +182,7 @@ def dashboard():
     files = []
     pdir  = panel_dir(pid)
     for name in sorted(os.listdir(pdir)):
+        if name == ".requirements_installed": continue
         fp = os.path.join(pdir, name)
         if os.path.isfile(fp):
             files.append({"name":name, "size":os.path.getsize(fp),
@@ -242,14 +246,24 @@ def _start(pid):
         return False, f"{missing} not found — upload your files first"
     req = os.path.join(pdir, "requirements.txt")
     if os.path.exists(req):
-        push_log(pid, "[T10] Installing requirements.txt ...")
-        try:
-            r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q",
-                                "--break-system-packages", "--no-input"],
-                               capture_output=True, text=True, cwd=pdir, timeout=180)
-            push_log(pid, "[T10] Done." if r.returncode == 0 else f"[T10] pip: {r.stderr[:300]}")
-        except subprocess.TimeoutExpired:
-            push_log(pid, "[T10] pip timed out — starting anyway.")
+        req_hash = hashlib.sha256(open(req, "rb").read()).hexdigest()
+        marker = os.path.join(pdir, ".requirements_installed")
+        prev_hash = open(marker).read().strip() if os.path.exists(marker) else None
+        if req_hash == prev_hash:
+            push_log(pid, "[T10] requirements.txt unchanged — skipping reinstall (fast start).")
+        else:
+            push_log(pid, "[T10] Installing requirements.txt ...")
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q",
+                                    "--break-system-packages", "--no-input"],
+                                   capture_output=True, text=True, cwd=pdir, timeout=180)
+                if r.returncode == 0:
+                    push_log(pid, "[T10] Done.")
+                    with open(marker, "w") as mf: mf.write(req_hash)
+                else:
+                    push_log(pid, f"[T10] pip: {r.stderr[:300]}")
+            except subprocess.TimeoutExpired:
+                push_log(pid, "[T10] pip timed out — starting anyway.")
     push_log(pid, f"[T10] Starting: {cmd}")
     try:
         proc = subprocess.Popen(cmd, shell=True, cwd=pdir,
@@ -373,6 +387,7 @@ def upload_file():
 def list_files():
     pdir = panel_dir(session["panel_id"]); files = []
     for name in sorted(os.listdir(pdir)):
+        if name == ".requirements_installed": continue
         fp = os.path.join(pdir, name)
         if os.path.isfile(fp):
             files.append({"name":name,"size":os.path.getsize(fp),
