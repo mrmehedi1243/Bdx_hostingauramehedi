@@ -531,9 +531,65 @@ def custom_static(filename):
     from flask import send_from_directory
     return send_from_directory(os.path.join(BASE_DIR, "static"), filename)
 
+# ── 24/7 keep-alive: resume-on-boot + periodic restart sweep ─────────────────────
+RESTART_INTERVAL_SEC = 15 * 60  # 15 minutes, per user request
+
+def _resume_running_panels():
+    """Called on boot (and can't hurt to re-check periodically): any panel whose
+    DB status is 'running' but whose process isn't actually alive in this process
+    gets (re)started. This is what makes hosted bots survive a server reboot,
+    code deploy, or crash — without it a bot looks 'gone' until you press START."""
+    try:
+        with get_db() as db:
+            rows = db.execute("SELECT id, expires_at FROM panels WHERE status='running'").fetchall()
+        for row in rows:
+            pid = row["id"]
+            if pid in PROCESSES:
+                continue
+            if is_expired(row["expires_at"]):
+                continue
+            push_log(pid, "[T10] Server restarted — auto-resuming your bot...")
+            CRASH_COUNT.pop(pid, None)
+            _start(pid)
+    except Exception as e:
+        logger_print(f"[T10] resume-on-boot error: {e}")
+
+def _periodic_restart_sweep():
+    """Every RESTART_INTERVAL_SEC, refresh every currently running bot (clean
+    restart) and re-launch any that should be running but aren't. Keeps 24/7
+    bots healthy and self-heals anything that silently died."""
+    while True:
+        time.sleep(RESTART_INTERVAL_SEC)
+        try:
+            with get_db() as db:
+                rows = db.execute("SELECT id, expires_at FROM panels WHERE status='running'").fetchall()
+            for row in rows:
+                pid = row["id"]
+                if is_expired(row["expires_at"]):
+                    continue
+                info = PROCESSES.pop(pid, None)
+                if info:
+                    push_log(pid, "[T10] Scheduled 15-minute refresh restart...")
+                    try:
+                        info["proc"].terminate(); info["proc"].wait(timeout=5)
+                    except Exception:
+                        try: info["proc"].kill()
+                        except Exception: pass
+                else:
+                    push_log(pid, "[T10] Scheduled check found bot not running — restarting...")
+                CRASH_COUNT.pop(pid, None)
+                _start(pid)
+        except Exception as e:
+            logger_print(f"[T10] periodic restart sweep error: {e}")
+
+def logger_print(msg):
+    print(msg, flush=True)
+
 # ── Boot ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
+    _resume_running_panels()
+    threading.Thread(target=_periodic_restart_sweep, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     print(f"[T10-MEHEDI] Listening on :{port}  base={BP or '/'}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
