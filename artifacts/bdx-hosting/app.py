@@ -115,12 +115,34 @@ def proc_stats(pid):
         return {"status":"running","uptime":fmt_up(time.time()-info["start_time"]),"cpu":f"{cpu:.1f}","ram":str(ram)}
     except: return {"status":"stopped","uptime":"0m 0s","cpu":"0.0","ram":"0"}
 
+CRASH_COUNT = {}  # pid -> consecutive-crash counter, resets on manual start/stop
+
 def stream_proc(pid, proc):
     for raw in iter(proc.stdout.readline, b""):
         push_log(pid, raw.decode("utf-8", errors="replace").rstrip())
     proc.wait()
+    still_tracked = PROCESSES.get(pid, {}).get("proc") is proc
     push_log(pid, f"\n[PROCESS EXITED — code {proc.returncode}]")
-    PROCESSES.pop(pid, None)
+    if still_tracked:
+        PROCESSES.pop(pid, None)
+    if still_tracked:
+        # Process exited on its own (not via manual STOP) — treat as a crash and
+        # auto-restart so 24/7-hosted bots stay online.
+        n = CRASH_COUNT.get(pid, 0) + 1
+        CRASH_COUNT[pid] = n
+        if n <= 20:
+            delay = min(30, 2 * n)
+            push_log(pid, f"[T10] Unexpected exit — auto-restarting in {delay}s (attempt {n})...")
+            def _delayed_restart():
+                time.sleep(delay)
+                with get_db() as db:
+                    row = db.execute("SELECT expires_at FROM panels WHERE id=?", (pid,)).fetchone()
+                if row and not is_expired(row["expires_at"]) and pid not in PROCESSES:
+                    _start(pid)
+            threading.Thread(target=_delayed_restart, daemon=True).start()
+            return
+        else:
+            push_log(pid, "[T10] Too many crashes — giving up auto-restart. Check your code and press START manually.")
     with get_db() as db:
         db.execute("UPDATE panels SET status='stopped' WHERE id=?", (pid,)); db.commit()
 
@@ -218,6 +240,7 @@ def _start(pid):
 def start_panel():
     pid = session["panel_id"]
     if pid in PROCESSES: return jsonify({"ok":False,"msg":"Already running"})
+    CRASH_COUNT.pop(pid, None)
     ok, msg = _start(pid)
     return jsonify({"ok":ok,"msg":msg})
 
@@ -225,6 +248,7 @@ def start_panel():
 @login_required
 def stop_panel():
     pid = session["panel_id"]
+    CRASH_COUNT.pop(pid, None)
     info = PROCESSES.pop(pid, None)
     if info:
         try: info["proc"].terminate(); info["proc"].wait(timeout=5)
@@ -240,6 +264,7 @@ def stop_panel():
 @login_required
 def restart_panel():
     pid = session["panel_id"]
+    CRASH_COUNT.pop(pid, None)
     info = PROCESSES.pop(pid, None)
     if info:
         try: info["proc"].terminate(); info["proc"].wait(timeout=5)
