@@ -13,6 +13,15 @@ localPort = 5000
 [services.development]
 run = "PORT=5000 BASE_PATH=/bdx python3 app.py"
 
+[services.production]
+
+[services.production.run]
+args = ["python3", "artifacts/bdx-hosting/app.py"]
+
+[services.production.run.env]
+PORT = "5000"
+BASE_PATH = "/bdx"
+
 [services.env]
 PORT = "5000"
 BASE_PATH = "/bdx"
