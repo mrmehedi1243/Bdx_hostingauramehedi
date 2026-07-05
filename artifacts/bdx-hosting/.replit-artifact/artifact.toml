@@ -1,6 +1,6 @@
 kind = "web"
 previewPath = "/bdx"
-title = "BDX HOSTING"
+title = "T10-MEHEDI"
 version = "1.0.0"
 id = "artifacts/bdx-hosting"
 router = "path"

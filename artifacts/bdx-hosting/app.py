@@ -18,6 +18,7 @@ BP = os.environ.get("BASE_PATH", "").rstrip("/")   # e.g. "/bdx" or ""
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "bdx-hosting-secret-2025")
 app.config["SESSION_COOKIE_PATH"] = BP + "/" if BP else "/"
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB upload limit
 
 # ── In-memory process & log stores ─────────────────────────────────────────────
 PROCESSES = {}   # panel_id -> {"proc": Popen, "start_time": float}
@@ -193,14 +194,14 @@ def _start(pid):
     pdir = panel_dir(pid); cmd = panel["start_command"]
     req = os.path.join(pdir, "requirements.txt")
     if os.path.exists(req):
-        push_log(pid, "[BDX] Installing requirements.txt ...")
+        push_log(pid, "[T10] Installing requirements.txt ...")
         try:
             r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q"],
                                capture_output=True, text=True, cwd=pdir, timeout=120)
-            push_log(pid, "[BDX] Done." if r.returncode == 0 else f"[BDX] pip: {r.stderr[:200]}")
+            push_log(pid, "[T10] Done." if r.returncode == 0 else f"[T10] pip: {r.stderr[:200]}")
         except subprocess.TimeoutExpired:
-            push_log(pid, "[BDX] pip timed out — starting anyway.")
-    push_log(pid, f"[BDX] Starting: {cmd}")
+            push_log(pid, "[T10] pip timed out — starting anyway.")
+    push_log(pid, f"[T10] Starting: {cmd}")
     try:
         proc = subprocess.Popen(cmd, shell=True, cwd=pdir,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -231,7 +232,7 @@ def stop_panel():
             except: pass
     with get_db() as db:
         db.execute("UPDATE panels SET status='stopped' WHERE id=?", (pid,)); db.commit()
-    push_log(pid, "[BDX] Process stopped.")
+    push_log(pid, "[T10] Process stopped.")
     return jsonify({"ok":True})
 
 @app.route(BP + "/panel/restart", methods=["POST"])
@@ -242,7 +243,7 @@ def restart_panel():
     if info:
         try: info["proc"].terminate(); info["proc"].wait(timeout=5)
         except: pass
-    push_log(pid, "[BDX] Restarting ...")
+    push_log(pid, "[T10] Restarting ...")
     time.sleep(0.3)
     ok, msg = _start(pid)
     return jsonify({"ok":ok,"msg":msg})
@@ -260,33 +261,58 @@ def panel_stats():
     return jsonify(proc_stats(session["panel_id"]))
 
 # ── Files ────────────────────────────────────────────────────────────────────────
-ALLOWED = {".py",".txt",".json",".env",".sh",".cfg",".ini",".yaml",".yml",
-           ".zip",".md",".toml",".js",".html",".css",".xml",".csv"}
+# Only truly dangerous / meaningless names are blocked; bot projects need almost
+# any extension (.py, .pyc, .bak, .proto, .db, .session, no-extension files, etc).
+BLOCKED_NAMES = {"", ".", ".."}
+
+def _safe_extract(zf, pdir):
+    base = os.path.realpath(pdir)
+    for member in zf.infolist():
+        target = os.path.realpath(os.path.join(pdir, member.filename))
+        if not (target == base or target.startswith(base + os.sep)):
+            continue  # skip zip-slip / path traversal entries
+        zf.extract(member, pdir)
 
 @app.route(BP + "/panel/upload", methods=["POST"])
 @login_required
 def upload_file():
     pid = session["panel_id"]; pdir = panel_dir(pid)
     files = request.files.getlist("files")
-    if not files: return jsonify({"ok":False,"msg":"No files"})
+    if not files: return jsonify({"ok":False,"msg":"No files selected"})
     uploaded, errors = [], []
     for f in files:
-        name = f.filename or ""; ext = os.path.splitext(name)[1].lower()
-        if ext not in ALLOWED: errors.append(f"{name}: type not allowed"); continue
-        dest = os.path.join(pdir, os.path.basename(name)); f.save(dest)
+        name = (f.filename or "").strip()
+        base = os.path.basename(name)
+        if base in BLOCKED_NAMES:
+            errors.append(f"{name or '(empty)'}: invalid filename"); continue
+        ext = os.path.splitext(base)[1].lower()
+        dest = os.path.join(pdir, base)
+        try:
+            f.save(dest)
+        except Exception as e:
+            errors.append(f"{name}: save failed — {e}"); continue
         if ext == ".zip":
             try:
-                with zipfile.ZipFile(dest,"r") as zf: zf.extractall(pdir)
-                os.remove(dest); uploaded.append(f"{name} (extracted)")
-            except Exception as e: errors.append(f"{name} ZIP error: {e}"); continue
-        else: uploaded.append(name)
+                with zipfile.ZipFile(dest, "r") as zf:
+                    _safe_extract(zf, pdir)
+                os.remove(dest)
+                uploaded.append(f"{name} (extracted)")
+            except zipfile.BadZipFile:
+                errors.append(f"{name}: not a valid ZIP file")
+            except Exception as e:
+                errors.append(f"{name} ZIP error: {e}")
+        else:
+            uploaded.append(name)
     auto_msg = None
     req = os.path.join(pdir, "requirements.txt")
-    if os.path.exists(req) and any("requirements.txt" in u for u in uploaded):
+    if os.path.exists(req) and (any("requirements.txt" in u for u in uploaded) or
+                                 any("(extracted)" in u for u in uploaded)):
         try:
             r = subprocess.run([sys.executable,"-m","pip","install","-r",req,"-q"],
-                               capture_output=True, text=True, cwd=pdir, timeout=120)
-            auto_msg = "requirements.txt installed" if r.returncode==0 else f"pip: {r.stderr[:150]}"
+                               capture_output=True, text=True, cwd=pdir, timeout=180)
+            auto_msg = "requirements.txt installed" if r.returncode==0 else f"pip: {r.stderr[:200]}"
+        except subprocess.TimeoutExpired:
+            auto_msg = "pip install timed out — try installing manually via startup command"
         except Exception as e: auto_msg = f"pip error: {e}"
     return jsonify({"ok":True,"uploaded":uploaded,"errors":errors,"auto_install":auto_msg})
 
@@ -457,5 +483,5 @@ def custom_static(filename):
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
-    print(f"[BDX HOSTING] Listening on :{port}  base={BP or '/'}")
+    print(f"[T10-MEHEDI] Listening on :{port}  base={BP or '/'}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)

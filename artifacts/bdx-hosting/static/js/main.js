@@ -31,7 +31,7 @@ function appendLine(line) {
   if (!consoleEl) return;
   const span = document.createElement("span");
   span.textContent = line + "\n";
-  if      (line.startsWith("[BDX]"))   span.className = "log-bdx";
+  if      (line.startsWith("[T10]"))   span.className = "log-bdx";
   else if (line.startsWith("[ERROR]") || line.includes("Error") || line.includes("Traceback"))
                                         span.className = "log-err";
   else if (line.startsWith("[INFO]"))   span.className = "log-info";

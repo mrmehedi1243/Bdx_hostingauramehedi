@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BDX HOSTING — {{ panel.username }}</title>
+<title>T10-MEHEDI — {{ panel.username }}</title>
 <link rel="stylesheet" href="{{ bp }}/static/css/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
   <div class="topbar-left">
     <div class="topbar-logo">
       <div class="logo-icon sm"><i class="fa-solid fa-cloud-arrow-up"></i></div>
-      <span><span class="white">BDX</span> <span class="blue">HOSTING</span></span>
+      <span><span class="white">T10</span><span class="blue">-MEHEDI</span></span>
     </div>
     <span class="topbar-welcome">Welcome: <b>{{ panel.username }}</b></span>
   </div>
@@ -103,11 +103,11 @@
     <div class="files-header">
       <h3><i class="fa fa-folder-open blue"></i> Files</h3>
       <div class="upload-zone" id="upload-zone">
-        <input type="file" id="file-input" multiple accept=".py,.txt,.json,.env,.sh,.cfg,.ini,.yaml,.yml,.zip,.md,.toml" onchange="uploadFiles(this.files)">
+        <input type="file" id="file-input" multiple onchange="uploadFiles(this.files)">
         <label for="file-input" class="upload-label">
           <i class="fa fa-cloud-arrow-up"></i>
           <span>Drop files here or <b>click to upload</b></span>
-          <small>.py .txt .json .env .zip .sh .yaml and more</small>
+          <small>Any file type accepted — .zip auto-extracts</small>
         </label>
       </div>
       <div id="upload-msg" class="upload-msg"></div>
