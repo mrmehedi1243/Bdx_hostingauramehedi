@@ -209,19 +209,45 @@ def console_stream():
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 # ── Process control ─────────────────────────────────────────────────────────────
+import shlex
+
+def _find_missing_script(cmd, pdir):
+    """If cmd looks like `python(3) <script>` / `node <script>` and that script
+    doesn't exist in pdir, return its name — else None. Lets us fail fast instead
+    of endlessly crash-looping on a missing entry file."""
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return None
+    if len(parts) < 2: return None
+    interpreter = os.path.basename(parts[0]).lower()
+    if interpreter not in ("python", "python3", "node", "nodejs"): return None
+    for tok in parts[1:]:
+        if tok.startswith("-"): continue
+        script = tok
+        if not os.path.isabs(script) and not os.path.exists(os.path.join(pdir, script)):
+            return script
+        return None
+    return None
+
 def _start(pid):
     with get_db() as db:
         panel = db.execute("SELECT * FROM panels WHERE id=?", (pid,)).fetchone()
     if not panel: return False, "Panel not found"
     if is_expired(panel["expires_at"]): return False, "Panel expired"
     pdir = panel_dir(pid); cmd = panel["start_command"]
+    missing = _find_missing_script(cmd, pdir)
+    if missing:
+        push_log(pid, f"[T10] ERROR: '{missing}' not found in your files. Upload it (or fix the Startup command) before pressing START.")
+        return False, f"{missing} not found — upload your files first"
     req = os.path.join(pdir, "requirements.txt")
     if os.path.exists(req):
         push_log(pid, "[T10] Installing requirements.txt ...")
         try:
-            r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q"],
-                               capture_output=True, text=True, cwd=pdir, timeout=120)
-            push_log(pid, "[T10] Done." if r.returncode == 0 else f"[T10] pip: {r.stderr[:200]}")
+            r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q",
+                                "--break-system-packages", "--no-input"],
+                               capture_output=True, text=True, cwd=pdir, timeout=180)
+            push_log(pid, "[T10] Done." if r.returncode == 0 else f"[T10] pip: {r.stderr[:300]}")
         except subprocess.TimeoutExpired:
             push_log(pid, "[T10] pip timed out — starting anyway.")
     push_log(pid, f"[T10] Starting: {cmd}")

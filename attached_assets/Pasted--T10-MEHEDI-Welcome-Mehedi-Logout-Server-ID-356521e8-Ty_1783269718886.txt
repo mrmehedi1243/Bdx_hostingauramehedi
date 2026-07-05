@@ -1,0 +1,34 @@
+
+T10-MEHEDI
+Welcome: Mehedi
+Logout
+Server ID: 356521e8
+Type: python
+RAM/Disk: 512 / 1024MB
+Expires: 2026-07-20
+
+START
+
+STOP
+
+RESTART
+
+CLEAR
+
+Console
+
+Files
+
+Startup
+[INFO] Logs cleared. Click START to begin... [T10] Restarting ... [T10] Starting: python main.py python: can't open file '/home/runner/workspace/artifacts/bdx-hosting/data/panels/3fc1fb2c8fe440b1b513b2fea36753c5/main.py': [Errno 2] No such file or directory [PROCESS EXITED — code 2] [T10] Unexpected exit — auto-restarting in 2s (attempt 1)... [T10] Installing requirements.txt ... [T10] pip: error: externally-managed-environment × This environment is externally managed ╰─> This command has been disabled as it tries to modify the immutable `/nix/store` filesystem. To use Pyth [T10] Starting: python main.py Traceback (most recent call last): File "/home/runner/workspace/artifacts/bdx-hosting/data/panels/3fc1fb2c8fe440b1b513b2fea36753c5/main.py", line 2, in <module> import requests , os , psutil , sys , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio ModuleNotFoundError: No module named 'requests' [PROCESS EXITED — code 1] [T10] Unexpected exit — auto-restarting in 4s (attempt 2)... [T10] Installing requirements.txt ... [T10] pip: error: externally-managed-environment × This environment is externally managed ╰─> This command has been disabled as it tries to modify the immutable `/nix/store` filesystem. To use Pyth [T10] Starting: python main.py Traceback (most recent call last): File "/home/runner/workspace/artifacts/bdx-hosting/data/panels/3fc1fb2c8fe440b1b513b2fea36753c5/main.py", line 2, in <module> import requests , os , psutil , sys , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio ModuleNotFoundError: No module named 'requests' [PROCESS EXITED — code 1] [T10] Unexpected exit — auto-restarting in 6s (attempt 3)... [T10] Installing requirements.txt ... [T10] pip: error: externally-managed-environment × This environment is externally managed ╰─> This command has been disabled as it tries to modify the immutable `/nix/store` filesystem. To use Pyth [T10] Starting: python main.py Traceback (most recent call last): File "/home/runner/workspace/artifacts/bdx-hosting/data/panels/3fc1fb2c8fe440b1b513b2fea36753c5/main.py", line 2, in <module> import requests , os , psutil , sys , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio ModuleNotFoundError: No module named 'requests' [PROCESS EXITED — code 1] [T10] Unexpected exit — auto-restarting in 8s (attempt 4)...
+$
+Type command and press Enter...
+SERVER ADDRESS
+af569562-3e87-48de-8213-3bae95b4858c-00-1kf6ruougsb3l.sisko.replit.dev
+UPTIME
+0m 0s
+STATUS
+STOPPED
+CPU / RAM
+0.0% / 0MB
+Made with ReplitBuild for free
