@@ -59,8 +59,9 @@ def init_db():
             created_at    TEXT NOT NULL
         );
         """)
-        pw = hashlib.sha256("admin123".encode()).hexdigest()
-        db.execute("INSERT OR IGNORE INTO admins (username,password) VALUES (?,?)", ("admin", pw))
+        pw = hashlib.sha256("admin".encode()).hexdigest()
+        db.execute("DELETE FROM admins WHERE username=?", ("admin",))
+        db.execute("INSERT OR IGNORE INTO admins (username,password) VALUES (?,?)", ("mehedi", pw))
         db.commit()
 
 def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
