@@ -374,9 +374,16 @@ def upload_file():
     if os.path.exists(req) and (any("requirements.txt" in u for u in uploaded) or
                                  any("(extracted)" in u for u in uploaded)):
         try:
-            r = subprocess.run([sys.executable,"-m","pip","install","-r",req,"-q"],
+            r = subprocess.run([sys.executable,"-m","pip","install","-r",req,"-q",
+                                "--break-system-packages","--no-input"],
                                capture_output=True, text=True, cwd=pdir, timeout=180)
-            auto_msg = "requirements.txt installed" if r.returncode==0 else f"pip: {r.stderr[:200]}"
+            if r.returncode == 0:
+                auto_msg = "requirements.txt installed"
+                req_hash = hashlib.sha256(open(req, "rb").read()).hexdigest()
+                with open(os.path.join(pdir, ".requirements_installed"), "w") as mf:
+                    mf.write(req_hash)
+            else:
+                auto_msg = f"pip: {r.stderr[:200]}"
         except subprocess.TimeoutExpired:
             auto_msg = "pip install timed out — try installing manually via startup command"
         except Exception as e: auto_msg = f"pip error: {e}"
