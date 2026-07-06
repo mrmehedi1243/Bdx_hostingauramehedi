@@ -1,29 +1,68 @@
 """
-T10-MEHEDI — Telegram bot fleet engine.
+T10-MEHEDI - Telegram bot fleet engine.
 
-The admin panel can register one or more Telegram bots (token + owner admin
-telegram-id). Each registered bot runs its own long-polling loop in a
-background thread. Regular users who /start a bot get a referral link; once
-they've referred 3 people, they can create their own hosting panel account
-right from the chat. The bot's owner (matched by telegram user id) gets an
-extra "Owner Panel" menu for broadcasting and stats.
+Built on python-telegram-bot v21+ (async). Each registered bot (token + owner
+Telegram user id, added from the admin panel) runs in its own background
+thread with its own asyncio event loop, so multiple independent bots can run
+concurrently inside a single Flask process.
+
+Features:
+- Persistent ReplyKeyboardMarkup main menu (10 buttons, 2 columns x 5 rows).
+- Referral system: every successful referral pays the referrer coins; coins
+  are spent to create a free hosting panel ("VPS") from inside the chat.
+- Owner (the admin id configured for this bot) has unlimited balance and
+  unrestricted access to every function.
+- Optional "force join channel": if the admin sets a channel for a bot, every
+  user must join that channel before they can use any bot feature.
+- All bot-facing text is in English.
 """
 import os
+import re
 import sqlite3
 import threading
-import time
+import asyncio
 import uuid
 import hashlib
 from datetime import datetime, timedelta
 
-import telebot
-from telebot import types
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters, ApplicationHandlerStop,
+)
+from telegram.error import TelegramError
 
 DB_PATH = None
 DATA_DIR = None
 
-BOT_INSTANCES = {}   # bot_id -> {"bot": TeleBot, "thread": Thread}
-REFERRAL_GOAL = 3    # referrals needed per panel-creation unlock
+BOT_INSTANCES = {}   # bot_id -> {"thread": Thread, "stop_flag": Event, "username": str}
+
+REFERRAL_GOAL = 3        # kept for backward compatibility / leaderboard context
+REFERRAL_BONUS = 10      # coins earned per successful referral
+VPS_COST = 30            # coins required to create a panel via the bot
+
+# ── Button layout: 2 columns x 5 rows ────────────────────────────────────────
+BTN_CREATE_VPS   = "\U0001F451 Create VPS"
+BTN_MY_VPS       = "\U0001F310 My VPS"
+BTN_REFER        = "\U0001F517 Refer & Earn"
+BTN_PROFILE      = "\U0001F464 My Profile"
+BTN_LEADERBOARD  = "\U0001F3C6 Leaderboard"
+BTN_SUPPORT      = "\U0001F91D Support"
+BTN_STORE        = "\U0001F6D2 Store"
+BTN_SYSTEM       = "\U0001F4CA System"
+BTN_TRANSFER     = "\U0001F464 Transfer"
+BTN_LANGUAGE     = "\U0001F30D Language"
+
+MAIN_MENU_LAYOUT = [
+    [BTN_CREATE_VPS, BTN_MY_VPS],
+    [BTN_REFER, BTN_PROFILE],
+    [BTN_LEADERBOARD, BTN_SUPPORT],
+    [BTN_STORE, BTN_SYSTEM],
+    [BTN_TRANSFER, BTN_LANGUAGE],
+]
+ALL_BUTTON_TEXTS = [b for row in MAIN_MENU_LAYOUT for b in row]
 
 
 def init(db_path, data_dir):
@@ -33,7 +72,7 @@ def init(db_path, data_dir):
 
 
 def _db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -48,249 +87,525 @@ def _panel_dir(pid):
     return d
 
 
+def _main_keyboard():
+    return ReplyKeyboardMarkup(MAIN_MENU_LAYOUT, resize_keyboard=True, one_time_keyboard=False)
+
+
+def _is_owner(user_id, owner_admin_id):
+    return str(user_id) == str(owner_admin_id)
+
+
 def _get_or_create_user(bot_id, tg_user, referred_by=None):
+    """Returns (user_row_dict, is_new_user, referral_awarded)."""
     uid = str(tg_user.id)
     with _db() as db:
         row = db.execute(
             "SELECT * FROM tg_bot_users WHERE bot_id=? AND tg_user_id=?", (bot_id, uid)
         ).fetchone()
         if row:
-            return dict(row), False
+            return dict(row), False, False
+
         rb = referred_by if (referred_by and referred_by != uid) else None
+        referral_awarded = False
         if rb:
             exists = db.execute(
                 "SELECT 1 FROM tg_bot_users WHERE bot_id=? AND tg_user_id=?", (bot_id, rb)
             ).fetchone()
             if not exists:
                 rb = None
+
         db.execute(
             """INSERT INTO tg_bot_users (bot_id, tg_user_id, tg_username, referred_by,
-                ref_count, panels_created, created_at)
-               VALUES (?,?,?,?,0,0,?)""",
+                ref_count, panels_created, balance, lang, created_at)
+               VALUES (?,?,?,?,0,0,0,'en',?)""",
             (bot_id, uid, tg_user.username or "", rb, datetime.now().isoformat()),
         )
         if rb:
             db.execute(
-                "UPDATE tg_bot_users SET ref_count = ref_count + 1 WHERE bot_id=? AND tg_user_id=?",
-                (bot_id, rb),
+                """UPDATE tg_bot_users SET ref_count = ref_count + 1,
+                   balance = balance + ? WHERE bot_id=? AND tg_user_id=?""",
+                (REFERRAL_BONUS, bot_id, rb),
             )
+            referral_awarded = True
         db.commit()
         row = db.execute(
             "SELECT * FROM tg_bot_users WHERE bot_id=? AND tg_user_id=?", (bot_id, uid)
         ).fetchone()
-        return dict(row), True
+        return dict(row), True, referral_awarded
 
 
-def _main_menu(bot_id, tg_user_id, owner_admin_id):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🔗 আমার রেফার লিংক", callback_data="ref_link"))
-    kb.add(types.InlineKeyboardButton("📊 আমার স্ট্যাটাস", callback_data="my_stats"))
-    kb.add(types.InlineKeyboardButton("🛠️ প্যানেল তৈরি করুন", callback_data="create_panel"))
-    if str(tg_user_id) == str(owner_admin_id):
-        kb.add(types.InlineKeyboardButton("⚙️ Owner Panel", callback_data="owner_panel"))
-    return kb
+def _get_user(bot_id, tg_user_id):
+    with _db() as db:
+        row = db.execute(
+            "SELECT * FROM tg_bot_users WHERE bot_id=? AND tg_user_id=?",
+            (bot_id, str(tg_user_id)),
+        ).fetchone()
+    return dict(row) if row else None
 
 
-def _back_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("⬅️ মেনুতে ফিরুন", callback_data="back_menu"))
-    return kb
+def _channel_join_url(force_channel):
+    fc = (force_channel or "").strip()
+    if fc.startswith("http"):
+        return fc
+    if fc.startswith("@"):
+        return f"https://t.me/{fc[1:]}"
+    return f"https://t.me/{fc}"
 
 
-def start_bot(bot_id, token, owner_admin_id):
-    if bot_id in BOT_INSTANCES:
-        return True, "Already running"
+async def _is_member(bot, force_channel, user_id):
     try:
-        bot = telebot.TeleBot(token, threaded=True)
-        me = bot.get_me()
-    except Exception as e:
-        return False, f"Invalid token: {e}"
+        member = await bot.get_chat_member(force_channel, user_id)
+        return member.status not in ("left", "kicked")
+    except TelegramError:
+        return False
 
-    @bot.message_handler(commands=["start"])
-    def _start(message):
-        parts = (message.text or "").split(maxsplit=1)
-        ref = parts[1].strip() if len(parts) > 1 else None
-        user, _ = _get_or_create_user(bot_id, message.from_user, referred_by=ref)
-        bot.send_message(
-            message.chat.id,
-            f"👋 স্বাগতম, <b>{message.from_user.first_name}</b>!\n\n"
-            f"🤖 এই বট দিয়ে আপনি ৩ জন বন্ধুকে রেফার করে নিজের হোস্টিং প্যানেল ফ্রি তৈরি করতে পারবেন।\n"
-            f"নিচের মেনু থেকে বেছে নিন 👇",
-            parse_mode="HTML",
-            reply_markup=_main_menu(bot_id, message.from_user.id, owner_admin_id),
-        )
 
-    def _render_menu(chat_id, tg_user_id, message_id=None):
-        text = "🏠 <b>মূল মেনু</b>\nনিচের অপশন থেকে বেছে নিন 👇"
-        kb = _main_menu(bot_id, tg_user_id, owner_admin_id)
-        if message_id:
-            bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
-        else:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+def build_application(bot_id, token, owner_admin_id, force_channel=None):
+    application = ApplicationBuilder().token(token).build()
+    bot_ctx = {"owner_admin_id": str(owner_admin_id), "force_channel": force_channel}
 
-    @bot.callback_query_handler(func=lambda c: c.data == "back_menu")
-    def _cb_back(c):
-        _render_menu(c.message.chat.id, c.from_user.id, c.message.message_id)
-
-    @bot.callback_query_handler(func=lambda c: c.data == "ref_link")
-    def _cb_reflink(c):
-        _get_or_create_user(bot_id, c.from_user)
-        link = f"https://t.me/{me.username}?start={c.from_user.id}"
-        bot.edit_message_text(
-            f"🔗 <b>আপনার রেফার লিংক</b>\n\n<code>{link}</code>\n\n"
-            f"এই লিংক বন্ধুদের পাঠান — {REFERRAL_GOAL} জন জয়েন করলে আপনি প্যানেল তৈরি করতে পারবেন!",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_back_menu(),
-        )
-
-    @bot.callback_query_handler(func=lambda c: c.data == "my_stats")
-    def _cb_stats(c):
-        user, _ = _get_or_create_user(bot_id, c.from_user)
-        unlocked = user["ref_count"] // REFERRAL_GOAL - user["panels_created"]
-        bot.edit_message_text(
-            f"📊 <b>আপনার স্ট্যাটাস</b>\n\n"
-            f"👥 মোট রেফার: <b>{user['ref_count']}</b>\n"
-            f"🖥️ তৈরি করা প্যানেল: <b>{user['panels_created']}</b>\n"
-            f"🔓 এখন তৈরি করা যাবে: <b>{max(0, unlocked)}</b> টি প্যানেল\n\n"
-            f"প্রতি {REFERRAL_GOAL} জন রেফারে ১টি ফ্রি প্যানেল পাবেন।",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_back_menu(),
-        )
-
-    @bot.callback_query_handler(func=lambda c: c.data == "create_panel")
-    def _cb_create(c):
-        user, _ = _get_or_create_user(bot_id, c.from_user)
-        unlocked = user["ref_count"] // REFERRAL_GOAL - user["panels_created"]
-        if unlocked <= 0:
-            need = REFERRAL_GOAL - (user["ref_count"] % REFERRAL_GOAL)
-            bot.answer_callback_query(c.id, "❌ এখনো আনলক হয়নি!", show_alert=True)
-            bot.edit_message_text(
-                f"🔒 <b>প্যানেল তৈরি লক করা আছে</b>\n\n"
-                f"আরও <b>{need}</b> জন রেফার করলে আনলক হবে।\n"
-                f"'🔗 আমার রেফার লিংক' থেকে লিংক নিন।",
-                c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=_back_menu(),
+    # ── Force-join gate (runs before every other handler) ───────────────────
+    async def _gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        fc = bot_ctx["force_channel"]
+        user = update.effective_user
+        if not fc or not user or _is_owner(user.id, bot_ctx["owner_admin_id"]):
+            return
+        if await _is_member(context.bot, fc, user.id):
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001F4E2 Join Channel", url=_channel_join_url(fc))],
+            [InlineKeyboardButton("\u2705 I've Joined", callback_data="check_join")],
+        ])
+        target = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if target:
+            await target.reply_text(
+                "\U0001F512 <b>You must join our channel to use this bot.</b>\n\n"
+                "Please join the channel below, then tap \u201cI've Joined\u201d.",
+                parse_mode="HTML", reply_markup=kb,
             )
-            return
-        bot.edit_message_text(
-            "🛠️ <b>প্যানেল তৈরি</b>\n\nইউজারনেম লিখে পাঠান (শুধু চ্যাটে টাইপ করুন):",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML",
+        raise ApplicationHandlerStop
+
+    application.add_handler(MessageHandler(filters.ALL, _gate), group=-1)
+    application.add_handler(CallbackQueryHandler(_gate, pattern="^(?!check_join$).*"), group=-1)
+
+    # ── /start ────────────────────────────────────────────────────────────
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        ref = context.args[0].strip() if context.args else None
+        user, is_new, referral_awarded = _get_or_create_user(bot_id, update.effective_user, referred_by=ref)
+        if referral_awarded and user.get("referred_by"):
+            try:
+                await context.bot.send_message(
+                    int(user["referred_by"]),
+                    f"\U0001F389 Someone joined using your referral link! You earned +{REFERRAL_BONUS} coins.",
+                )
+            except TelegramError:
+                pass
+        await update.effective_message.reply_text(
+            f"\U0001F44B Welcome, <b>{update.effective_user.first_name}</b>!\n\n"
+            f"Use this bot to manage your hosting panel, refer friends, and earn free VPS credits.\n"
+            f"Choose an option from the menu below \U0001F447",
+            parse_mode="HTML", reply_markup=_main_keyboard(),
         )
-        bot.register_next_step_handler_by_chat_id(c.message.chat.id, _ask_username, c.from_user.id)
 
-    def _ask_username(message, tg_user_id):
-        username = (message.text or "").strip()
-        if not username:
-            bot.send_message(message.chat.id, "❌ খালি রাখা যাবে না। আবার চেষ্টা করুন — ইউজারনেম লিখুন:")
-            bot.register_next_step_handler_by_chat_id(message.chat.id, _ask_username, tg_user_id)
-            return
-        bot.send_message(message.chat.id, "🔑 এখন পাসওয়ার্ড লিখে পাঠান:")
-        bot.register_next_step_handler_by_chat_id(message.chat.id, _ask_password, tg_user_id, username)
+    application.add_handler(CommandHandler("start", cmd_start))
 
-    def _ask_password(message, tg_user_id, username):
-        password = (message.text or "").strip()
-        if not password:
-            bot.send_message(message.chat.id, "❌ খালি রাখা যাবে না। আবার পাসওয়ার্ড লিখুন:")
-            bot.register_next_step_handler_by_chat_id(message.chat.id, _ask_password, tg_user_id, username)
-            return
+    # ── Check-join callback ──────────────────────────────────────────────
+    async def cb_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        fc = bot_ctx["force_channel"]
+        if not fc or await _is_member(context.bot, fc, q.from_user.id):
+            await q.answer("\u2705 Verified! You can now use the bot.")
+            await q.message.reply_text(
+                "\u2705 <b>Thanks for joining!</b> You now have full access.",
+                parse_mode="HTML", reply_markup=_main_keyboard(),
+            )
+        else:
+            await q.answer("\u274C You haven't joined the channel yet.", show_alert=True)
+
+    application.add_handler(CallbackQueryHandler(cb_check_join, pattern="^check_join$"))
+
+    # ── Button: My Profile ───────────────────────────────────────────────
+    async def btn_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        user = _get_user(bot_id, u.id) or {}
+        owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+        balance = "\u221E Unlimited (Admin)" if owner else f"{user.get('balance', 0)} coins"
+        await update.effective_message.reply_text(
+            f"\U0001F464 <b>My Profile</b>\n\n"
+            f"\U0001F194 Telegram ID: <code>{u.id}</code>\n"
+            f"\U0001F4B0 Balance: <b>{balance}</b>\n"
+            f"\U0001F465 Total Referrals: <b>{user.get('ref_count', 0)}</b>\n"
+            f"\U0001F5A5\uFE0F VPS Created: <b>{user.get('panels_created', 0)}</b>\n"
+            f"\U0001F30D Language: <b>{(user.get('lang') or 'en').upper()}</b>",
+            parse_mode="HTML",
+        )
+
+    # ── Button: Refer & Earn ─────────────────────────────────────────────
+    async def btn_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        _get_or_create_user(bot_id, u)
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start={u.id}"
+        await update.effective_message.reply_text(
+            f"\U0001F517 <b>Refer & Earn</b>\n\n"
+            f"Share your link — you earn <b>+{REFERRAL_BONUS} coins</b> for every friend who joins!\n\n"
+            f"<code>{link}</code>\n\n"
+            f"A free VPS costs <b>{VPS_COST} coins</b>.",
+            parse_mode="HTML",
+        )
+
+    # ── Button: My VPS ────────────────────────────────────────────────────
+    async def btn_my_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
         with _db() as db:
-            user_row = db.execute(
-                "SELECT * FROM tg_bot_users WHERE bot_id=? AND tg_user_id=?", (bot_id, str(tg_user_id))
-            ).fetchone()
-        unlocked = (user_row["ref_count"] // REFERRAL_GOAL - user_row["panels_created"]) if user_row else 0
-        if unlocked <= 0:
-            bot.send_message(message.chat.id, "🔒 আপনার আনলক শেষ হয়ে গেছে — আরও রেফার করুন।")
-            return
-        pid = uuid.uuid4().hex
-        sid = uuid.uuid4().hex[:8]
-        exp = (datetime.now() + timedelta(days=15)).isoformat()
-        try:
-            with _db() as db:
-                db.execute(
-                    """INSERT INTO panels
-                        (id,username,password,server_id,type,ram_limit,disk_limit,start_command,status,expires_at,created_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (pid, username, _hash_pw(password), sid, "python", 512, 1024,
-                     "python main.py", "stopped", exp, datetime.now().isoformat()),
-                )
-                db.execute(
-                    "UPDATE tg_bot_users SET panels_created = panels_created + 1 WHERE bot_id=? AND tg_user_id=?",
-                    (bot_id, str(tg_user_id)),
-                )
-                db.commit()
-            _panel_dir(pid)
-            bot.send_message(
-                message.chat.id,
-                f"✅ <b>প্যানেল তৈরি হয়ে গেছে!</b>\n\n"
-                f"👤 ইউজারনেম: <code>{username}</code>\n"
-                f"🔑 পাসওয়ার্ড: <code>{password}</code>\n"
-                f"📅 মেয়াদ: ১৫ দিন\n\n"
-                f"এখন প্যানেলে লগইন করে বট আপলোড করুন।",
+            rows = db.execute(
+                "SELECT * FROM panels WHERE created_via_bot_id=? AND created_via_tg_id=? ORDER BY created_at DESC",
+                (bot_id, str(u.id)),
+            ).fetchall() if _has_bot_columns() else []
+        if not rows:
+            await update.effective_message.reply_text(
+                "\U0001F310 <b>My VPS</b>\n\nYou don't have any VPS yet. Tap \u201cCreate VPS\u201d to get one!",
                 parse_mode="HTML",
             )
-        except sqlite3.IntegrityError:
-            bot.send_message(message.chat.id, "❌ এই ইউজারনেম আগে থেকেই আছে — অন্য একটা ইউজারনেম দিয়ে আবার '🛠️ প্যানেল তৈরি করুন' চাপুন।")
-
-    @bot.callback_query_handler(func=lambda c: c.data == "owner_panel")
-    def _cb_owner(c):
-        if str(c.from_user.id) != str(owner_admin_id):
-            bot.answer_callback_query(c.id, "⛔ শুধুমাত্র মালিকের জন্য।", show_alert=True)
             return
+        lines = [f"\U0001F310 <b>My VPS ({len(rows)})</b>\n"]
+        for p in rows:
+            lines.append(
+                f"\u2022 <b>{p['username']}</b> | Server: <code>{p['server_id']}</code> | "
+                f"Status: {p['status']} | Expires: {p['expires_at'][:10]}"
+            )
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── Button: Create VPS (starts a text conversation) ─────────────────
+    async def btn_create_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+        user = _get_user(bot_id, u.id) or {}
+        if not owner and (user.get("balance", 0) or 0) < VPS_COST:
+            need = VPS_COST - (user.get("balance", 0) or 0)
+            await update.effective_message.reply_text(
+                f"\U0001F512 <b>Not enough coins</b>\n\n"
+                f"Creating a VPS costs <b>{VPS_COST} coins</b>. You need <b>{need}</b> more.\n"
+                f"Use \u201cRefer & Earn\u201d to invite friends and earn coins.",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data["pending"] = "vps_username"
+        await update.effective_message.reply_text(
+            "\U0001F6E0\uFE0F <b>Create VPS</b>\n\nSend the username you want for your panel:",
+            parse_mode="HTML",
+        )
+
+    # ── Button: Transfer (starts a text conversation) ────────────────────
+    async def btn_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data["pending"] = "transfer_target"
+        await update.effective_message.reply_text(
+            "\U0001F464 <b>Transfer Coins</b>\n\nSend the Telegram ID of the user you want to send coins to:",
+            parse_mode="HTML",
+        )
+
+    # ── Button: Leaderboard ───────────────────────────────────────────────
+    async def btn_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        with _db() as db:
+            rows = db.execute(
+                "SELECT tg_user_id, tg_username, ref_count FROM tg_bot_users "
+                "WHERE bot_id=? ORDER BY ref_count DESC LIMIT 10",
+                (bot_id,),
+            ).fetchall()
+        if not rows:
+            await update.effective_message.reply_text("\U0001F3C6 <b>Leaderboard</b>\n\nNo data yet.", parse_mode="HTML")
+            return
+        medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
+        lines = ["\U0001F3C6 <b>Top Referrers</b>\n"]
+        for i, r in enumerate(rows):
+            name = f"@{r['tg_username']}" if r["tg_username"] else f"ID {r['tg_user_id']}"
+            prefix = medals[i] if i < 3 else f"{i+1}."
+            lines.append(f"{prefix} {name} — <b>{r['ref_count']}</b> referrals")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── Button: Support ───────────────────────────────────────────────────
+    async def btn_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.effective_message.reply_text(
+            "\U0001F91D <b>Support</b>\n\n"
+            "Need help? Contact the bot owner directly or reply here and the admin will assist you.",
+            parse_mode="HTML",
+        )
+
+    # ── Button: Store ─────────────────────────────────────────────────────
+    async def btn_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.effective_message.reply_text(
+            "\U0001F6D2 <b>Store</b>\n\n"
+            f"\u2022 <b>Standard VPS</b> — {VPS_COST} coins (512MB RAM, 1GB Disk, 15 days)\n\n"
+            "Earn coins with \u201cRefer & Earn\u201d, then tap \u201cCreate VPS\u201d to redeem.",
+            parse_mode="HTML",
+        )
+
+    # ── Button: System ────────────────────────────────────────────────────
+    async def btn_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with _db() as db:
             total_users = db.execute("SELECT COUNT(*) n FROM tg_bot_users WHERE bot_id=?", (bot_id,)).fetchone()["n"]
             total_panels = db.execute("SELECT COALESCE(SUM(panels_created),0) n FROM tg_bot_users WHERE bot_id=?", (bot_id,)).fetchone()["n"]
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(types.InlineKeyboardButton("📢 সবাইকে মেসেজ পাঠান", callback_data="broadcast"))
-        kb.add(types.InlineKeyboardButton("⬅️ মেনুতে ফিরুন", callback_data="back_menu"))
-        bot.edit_message_text(
-            f"⚙️ <b>Owner Panel</b>\n\n👥 মোট ইউজার: <b>{total_users}</b>\n🖥️ মোট প্যানেল তৈরি: <b>{total_panels}</b>",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=kb,
+        await update.effective_message.reply_text(
+            f"\U0001F4CA <b>System Status</b>\n\n"
+            f"\u2705 Bot: Online\n"
+            f"\U0001F465 Total Users: <b>{total_users}</b>\n"
+            f"\U0001F5A5\uFE0F Total VPS Created: <b>{total_panels}</b>",
+            parse_mode="HTML",
         )
 
-    @bot.callback_query_handler(func=lambda c: c.data == "broadcast")
-    def _cb_broadcast(c):
-        if str(c.from_user.id) != str(owner_admin_id):
-            bot.answer_callback_query(c.id, "⛔ শুধুমাত্র মালিকের জন্য।", show_alert=True)
-            return
-        bot.edit_message_text("📢 যে মেসেজটি সবাইকে পাঠাতে চান তা লিখুন:", c.message.chat.id, c.message.message_id)
-        bot.register_next_step_handler_by_chat_id(c.message.chat.id, _do_broadcast)
+    # ── Button: Language ──────────────────────────────────────────────────
+    async def btn_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("English", callback_data="lang_en"),
+             InlineKeyboardButton("\u09AC\u09BE\u0982\u09B2\u09BE", callback_data="lang_bn")],
+        ])
+        await update.effective_message.reply_text(
+            "\U0001F30D <b>Select Language</b>", parse_mode="HTML", reply_markup=kb,
+        )
 
-    def _do_broadcast(message):
-        text = message.text or ""
+    async def cb_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        lang = "bn" if q.data == "lang_bn" else "en"
         with _db() as db:
-            rows = db.execute("SELECT tg_user_id FROM tg_bot_users WHERE bot_id=?", (bot_id,)).fetchall()
-        sent = 0
-        for r in rows:
+            db.execute(
+                "UPDATE tg_bot_users SET lang=? WHERE bot_id=? AND tg_user_id=?",
+                (lang, bot_id, str(q.from_user.id)),
+            )
+            db.commit()
+        await q.answer("Language updated!")
+        await q.message.reply_text(f"\u2705 Language set to <b>{lang.upper()}</b>.", parse_mode="HTML")
+
+    application.add_handler(CallbackQueryHandler(cb_language, pattern="^lang_"))
+
+    BUTTON_HANDLERS = {
+        BTN_PROFILE: btn_profile,
+        BTN_REFER: btn_refer,
+        BTN_MY_VPS: btn_my_vps,
+        BTN_CREATE_VPS: btn_create_vps,
+        BTN_TRANSFER: btn_transfer,
+        BTN_LEADERBOARD: btn_leaderboard,
+        BTN_SUPPORT: btn_support,
+        BTN_STORE: btn_store,
+        BTN_SYSTEM: btn_system,
+        BTN_LANGUAGE: btn_language,
+    }
+
+    for text, handler in BUTTON_HANDLERS.items():
+        application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(text)}$"), handler))
+
+    # ── Free-text conversation fallback (VPS creation / transfer flows) ──
+    async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        pending = context.user_data.get("pending")
+        text = (update.effective_message.text or "").strip()
+        u = update.effective_user
+
+        if pending == "vps_username":
+            if not text:
+                await update.effective_message.reply_text("\u274C Username can't be empty. Send a username:")
+                return
+            context.user_data["pending_username"] = text
+            context.user_data["pending"] = "vps_password"
+            await update.effective_message.reply_text("\U0001F511 Now send a password for this panel:")
+            return
+
+        if pending == "vps_password":
+            if not text:
+                await update.effective_message.reply_text("\u274C Password can't be empty. Send a password:")
+                return
+            username = context.user_data.pop("pending_username", None)
+            context.user_data.pop("pending", None)
+            owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+            user = _get_user(bot_id, u.id) or {}
+            if not owner and (user.get("balance", 0) or 0) < VPS_COST:
+                await update.effective_message.reply_text("\U0001F512 You no longer have enough coins for this VPS.")
+                return
+            pid = uuid.uuid4().hex
+            sid = uuid.uuid4().hex[:8]
+            exp = (datetime.now() + timedelta(days=15)).isoformat()
             try:
-                bot.send_message(int(r["tg_user_id"]), f"📢 {text}")
-                sent += 1
+                with _db() as db:
+                    _insert_panel_via_bot(db, pid, username, text, sid, exp, bot_id, u.id)
+                    if not owner:
+                        db.execute(
+                            "UPDATE tg_bot_users SET balance = balance - ?, panels_created = panels_created + 1 "
+                            "WHERE bot_id=? AND tg_user_id=?",
+                            (VPS_COST, bot_id, str(u.id)),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE tg_bot_users SET panels_created = panels_created + 1 "
+                            "WHERE bot_id=? AND tg_user_id=?",
+                            (bot_id, str(u.id)),
+                        )
+                    db.commit()
+                _panel_dir(pid)
+                await update.effective_message.reply_text(
+                    f"\u2705 <b>VPS created successfully!</b>\n\n"
+                    f"\U0001F464 Username: <code>{username}</code>\n"
+                    f"\U0001F511 Password: <code>{text}</code>\n"
+                    f"\U0001F4C5 Duration: 15 days\n\n"
+                    f"Log in to the panel to upload and run your bot.",
+                    parse_mode="HTML",
+                )
+            except sqlite3.IntegrityError:
+                await update.effective_message.reply_text(
+                    "\u274C This username is already taken. Tap \u201cCreate VPS\u201d again with a different username."
+                )
+            return
+
+        if pending == "transfer_target":
+            if not text.isdigit():
+                await update.effective_message.reply_text("\u274C Send a valid numeric Telegram ID:")
+                return
+            target = _get_user(bot_id, text)
+            if not target:
+                await update.effective_message.reply_text(
+                    "\u274C That user hasn't used this bot yet. Ask them to /start it first, then try again."
+                )
+                context.user_data.pop("pending", None)
+                return
+            context.user_data["transfer_target"] = text
+            context.user_data["pending"] = "transfer_amount"
+            await update.effective_message.reply_text("\U0001F4B0 How many coins do you want to send?")
+            return
+
+        if pending == "transfer_amount":
+            if not text.isdigit() or int(text) <= 0:
+                await update.effective_message.reply_text("\u274C Send a valid positive number:")
+                return
+            amount = int(text)
+            target_id = context.user_data.pop("transfer_target", None)
+            context.user_data.pop("pending", None)
+            owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+            sender = _get_user(bot_id, u.id) or {}
+            if not owner and (sender.get("balance", 0) or 0) < amount:
+                await update.effective_message.reply_text("\U0001F512 You don't have enough coins for this transfer.")
+                return
+            with _db() as db:
+                if not owner:
+                    db.execute(
+                        "UPDATE tg_bot_users SET balance = balance - ? WHERE bot_id=? AND tg_user_id=?",
+                        (amount, bot_id, str(u.id)),
+                    )
+                db.execute(
+                    "UPDATE tg_bot_users SET balance = balance + ? WHERE bot_id=? AND tg_user_id=?",
+                    (amount, bot_id, target_id),
+                )
+                db.commit()
+            await update.effective_message.reply_text(f"\u2705 Sent {amount} coins to user {target_id}.")
+            try:
+                await context.bot.send_message(int(target_id), f"\U0001F4B0 You received {amount} coins from a transfer!")
+            except TelegramError:
+                pass
+            return
+
+        # No pending conversation and not a known button -> show menu hint
+        await update.effective_message.reply_text(
+            "Please use the menu buttons below \U0001F447", reply_markup=_main_keyboard()
+        )
+
+    button_pattern = "^(" + "|".join(re.escape(t) for t in ALL_BUTTON_TEXTS) + ")$"
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(button_pattern), text_fallback)
+    )
+
+    return application
+
+
+_PANEL_BOT_COLS_CHECKED = {"ok": None}
+
+
+def _has_bot_columns():
+    if _PANEL_BOT_COLS_CHECKED["ok"] is None:
+        with _db() as db:
+            cols = {r["name"] for r in db.execute("PRAGMA table_info(panels)").fetchall()}
+        _PANEL_BOT_COLS_CHECKED["ok"] = {"created_via_bot_id", "created_via_tg_id"}.issubset(cols)
+    return _PANEL_BOT_COLS_CHECKED["ok"]
+
+
+def _ensure_panel_bot_columns(db):
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(panels)").fetchall()}
+    if "created_via_bot_id" not in cols:
+        db.execute("ALTER TABLE panels ADD COLUMN created_via_bot_id INTEGER")
+    if "created_via_tg_id" not in cols:
+        db.execute("ALTER TABLE panels ADD COLUMN created_via_tg_id TEXT")
+    _PANEL_BOT_COLS_CHECKED["ok"] = True
+
+
+def _insert_panel_via_bot(db, pid, username, password, sid, exp, bot_id, tg_user_id):
+    _ensure_panel_bot_columns(db)
+    db.execute(
+        """INSERT INTO panels
+            (id,username,password,server_id,type,ram_limit,disk_limit,start_command,status,expires_at,created_at,
+             created_via_bot_id,created_via_tg_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, username, _hash_pw(password), sid, "python", 512, 1024,
+         "python main.py", "stopped", exp, datetime.now().isoformat(), bot_id, str(tg_user_id)),
+    )
+
+
+def start_bot(bot_id, token, owner_admin_id, force_channel=None):
+    if bot_id in BOT_INSTANCES:
+        return True, "Already running"
+
+    stop_flag = threading.Event()
+    ready = threading.Event()
+    result = {}
+
+    def runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        application = None
+        try:
+            application = build_application(bot_id, token, owner_admin_id, force_channel)
+            loop.run_until_complete(application.initialize())
+            me = loop.run_until_complete(application.bot.get_me())
+            result["username"] = me.username
+            loop.run_until_complete(application.start())
+            loop.run_until_complete(application.updater.start_polling(drop_pending_updates=True))
+            with _db() as db:
+                db.execute(
+                    "UPDATE tg_bots SET status='running', bot_username=? WHERE id=?",
+                    (me.username, bot_id),
+                )
+                db.commit()
+            ready.set()
+            while not stop_flag.is_set():
+                loop.run_until_complete(asyncio.sleep(1))
+        except Exception as e:
+            result["error"] = str(e)
+            ready.set()
+        finally:
+            try:
+                if application is not None:
+                    if application.updater and application.updater.running:
+                        loop.run_until_complete(application.updater.stop())
+                    if application.running:
+                        loop.run_until_complete(application.stop())
+                    loop.run_until_complete(application.shutdown())
             except Exception:
                 pass
-        bot.send_message(message.chat.id, f"✅ {sent} জনকে পাঠানো হয়েছে।")
+            loop.close()
 
-    def _poll():
-        with _db() as db:
-            db.execute("UPDATE tg_bots SET status='running', bot_username=? WHERE id=?", (me.username, bot_id))
-            db.commit()
-        while bot_id in BOT_INSTANCES:
-            try:
-                bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-            except Exception as e:
-                print(f"[T10-BOT-{bot_id}] polling error: {e}", flush=True)
-                time.sleep(5)
-            else:
-                break
-
-    t = threading.Thread(target=_poll, daemon=True)
-    BOT_INSTANCES[bot_id] = {"bot": bot, "thread": t, "username": me.username}
+    t = threading.Thread(target=runner, daemon=True)
     t.start()
-    return True, me.username
+    ready.wait(timeout=20)
+
+    if "error" in result:
+        return False, result["error"]
+    if "username" not in result:
+        stop_flag.set()
+        return False, "Timed out starting bot (check the token and network)"
+
+    BOT_INSTANCES[bot_id] = {"thread": t, "stop_flag": stop_flag, "username": result["username"]}
+    return True, result["username"]
 
 
 def stop_bot(bot_id):
     inst = BOT_INSTANCES.pop(bot_id, None)
     if inst:
-        try:
-            inst["bot"].stop_polling()
-        except Exception:
-            pass
+        inst["stop_flag"].set()
+        inst["thread"].join(timeout=15)
     with _db() as db:
         db.execute("UPDATE tg_bots SET status='stopped' WHERE id=?", (bot_id,))
         db.commit()
@@ -301,6 +616,6 @@ def resume_all():
         with _db() as db:
             rows = db.execute("SELECT * FROM tg_bots WHERE status='running'").fetchall()
         for row in rows:
-            start_bot(row["id"], row["token"], row["owner_admin_id"])
+            start_bot(row["id"], row["token"], row["owner_admin_id"], row["force_channel"])
     except Exception as e:
         print(f"[T10-BOT] resume_all error: {e}", flush=True)

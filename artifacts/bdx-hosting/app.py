@@ -67,6 +67,7 @@ def init_db():
             owner_admin_id  TEXT NOT NULL,
             bot_username    TEXT,
             status          TEXT NOT NULL DEFAULT 'stopped',
+            force_channel   TEXT,
             created_at      TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS tg_bot_users (
@@ -77,10 +78,21 @@ def init_db():
             referred_by     TEXT,
             ref_count       INTEGER NOT NULL DEFAULT 0,
             panels_created  INTEGER NOT NULL DEFAULT 0,
+            balance         INTEGER NOT NULL DEFAULT 0,
+            lang            TEXT NOT NULL DEFAULT 'en',
             created_at      TEXT NOT NULL,
             UNIQUE(bot_id, tg_user_id)
         );
         """)
+        # Lightweight migrations for DBs created before these columns existed
+        existing_bot_cols = {r["name"] for r in db.execute("PRAGMA table_info(tg_bots)").fetchall()}
+        if "force_channel" not in existing_bot_cols:
+            db.execute("ALTER TABLE tg_bots ADD COLUMN force_channel TEXT")
+        existing_user_cols = {r["name"] for r in db.execute("PRAGMA table_info(tg_bot_users)").fetchall()}
+        if "balance" not in existing_user_cols:
+            db.execute("ALTER TABLE tg_bot_users ADD COLUMN balance INTEGER NOT NULL DEFAULT 0")
+        if "lang" not in existing_user_cols:
+            db.execute("ALTER TABLE tg_bot_users ADD COLUMN lang TEXT NOT NULL DEFAULT 'en'")
         pw = hashlib.sha256("admin".encode()).hexdigest()
         db.execute("DELETE FROM admins WHERE username=?", ("admin",))
         db.execute("INSERT OR IGNORE INTO admins (username,password) VALUES (?,?)", ("mehedi", pw))
@@ -555,19 +567,20 @@ def admin_tgbots_add():
     data = request.get_json() or request.form
     token = (data.get("token") or "").strip()
     owner_admin_id = (data.get("owner_admin_id") or "").strip()
+    force_channel = (data.get("force_channel") or "").strip() or None
     if not token or not owner_admin_id:
         return jsonify({"ok": False, "msg": "Bot token and owner admin id both required"})
     try:
         with get_db() as db:
             db.execute(
-                "INSERT INTO tg_bots (token, owner_admin_id, status, created_at) VALUES (?,?,?,?)",
-                (token, owner_admin_id, "stopped", datetime.now().isoformat()),
+                "INSERT INTO tg_bots (token, owner_admin_id, status, force_channel, created_at) VALUES (?,?,?,?,?)",
+                (token, owner_admin_id, "stopped", force_channel, datetime.now().isoformat()),
             )
             db.commit()
             row = db.execute("SELECT * FROM tg_bots WHERE token=?", (token,)).fetchone()
     except sqlite3.IntegrityError:
         return jsonify({"ok": False, "msg": "This bot token is already added"})
-    ok, msg = bot_engine.start_bot(row["id"], token, owner_admin_id)
+    ok, msg = bot_engine.start_bot(row["id"], token, owner_admin_id, force_channel)
     if not ok:
         with get_db() as db:
             db.execute("DELETE FROM tg_bots WHERE id=?", (row["id"],)); db.commit()
@@ -585,8 +598,26 @@ def admin_tgbots_toggle():
     if bot_id in bot_engine.BOT_INSTANCES:
         bot_engine.stop_bot(bot_id)
         return jsonify({"ok": True, "status": "stopped"})
-    ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"])
+    ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"], row["force_channel"])
     return jsonify({"ok": ok, "status": "running" if ok else "stopped", "msg": msg})
+
+@app.route(BP + "/admin/tgbots/setchannel", methods=["POST"])
+@admin_required
+def admin_tgbots_setchannel():
+    data = request.get_json() or {}
+    bot_id = data.get("bot_id")
+    force_channel = (data.get("force_channel") or "").strip() or None
+    with get_db() as db:
+        row = db.execute("SELECT * FROM tg_bots WHERE id=?", (bot_id,)).fetchone()
+        if not row: return jsonify({"ok": False, "msg": "Not found"})
+        db.execute("UPDATE tg_bots SET force_channel=? WHERE id=?", (force_channel, bot_id))
+        db.commit()
+    if bot_id in bot_engine.BOT_INSTANCES:
+        bot_engine.stop_bot(bot_id)
+        ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"], force_channel)
+        if not ok:
+            return jsonify({"ok": False, "msg": msg})
+    return jsonify({"ok": True})
 
 @app.route(BP + "/admin/tgbots/delete", methods=["POST"])
 @admin_required
