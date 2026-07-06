@@ -7,10 +7,13 @@ import psutil
 from flask import (Flask, render_template, request, session,
                    redirect, url_for, jsonify, Response, stream_with_context)
 
+import bot_engine
+
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.path.join(BASE_DIR, "data", "panels")
 DB_PATH   = os.path.join(BASE_DIR, "data", "bdx.db")
 os.makedirs(DATA_DIR, exist_ok=True)
+bot_engine.init(DB_PATH, DATA_DIR)
 
 # Base path prefix (set via env on Replit, empty string on bare VPS)
 BP = os.environ.get("BASE_PATH", "").rstrip("/")   # e.g. "/bdx" or ""
@@ -57,6 +60,25 @@ def init_db():
             status        TEXT NOT NULL DEFAULT 'stopped',
             expires_at    TEXT NOT NULL,
             created_at    TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tg_bots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            token           TEXT UNIQUE NOT NULL,
+            owner_admin_id  TEXT NOT NULL,
+            bot_username    TEXT,
+            status          TEXT NOT NULL DEFAULT 'stopped',
+            created_at      TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tg_bot_users (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            tg_user_id      TEXT NOT NULL,
+            tg_username     TEXT,
+            referred_by     TEXT,
+            ref_count       INTEGER NOT NULL DEFAULT 0,
+            panels_created  INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            UNIQUE(bot_id, tg_user_id)
         );
         """)
         pw = hashlib.sha256("admin".encode()).hexdigest()
@@ -514,6 +536,69 @@ def admin_logout():
     session.pop("is_admin",None); session.pop("admin_name",None)
     return redirect(BP + "/admin")
 
+# ── Telegram Bot fleet management (admin) ─────────────────────────────────────────
+@app.route(BP + "/admin/tgbots")
+@admin_required
+def admin_tgbots():
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM tg_bots ORDER BY created_at DESC").fetchall()
+    bots = []
+    for r in rows:
+        d = dict(r)
+        d["live"] = r["id"] in bot_engine.BOT_INSTANCES
+        bots.append(d)
+    return jsonify({"ok": True, "bots": bots})
+
+@app.route(BP + "/admin/tgbots/add", methods=["POST"])
+@admin_required
+def admin_tgbots_add():
+    data = request.get_json() or request.form
+    token = (data.get("token") or "").strip()
+    owner_admin_id = (data.get("owner_admin_id") or "").strip()
+    if not token or not owner_admin_id:
+        return jsonify({"ok": False, "msg": "Bot token and owner admin id both required"})
+    try:
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO tg_bots (token, owner_admin_id, status, created_at) VALUES (?,?,?,?)",
+                (token, owner_admin_id, "stopped", datetime.now().isoformat()),
+            )
+            db.commit()
+            row = db.execute("SELECT * FROM tg_bots WHERE token=?", (token,)).fetchone()
+    except sqlite3.IntegrityError:
+        return jsonify({"ok": False, "msg": "This bot token is already added"})
+    ok, msg = bot_engine.start_bot(row["id"], token, owner_admin_id)
+    if not ok:
+        with get_db() as db:
+            db.execute("DELETE FROM tg_bots WHERE id=?", (row["id"],)); db.commit()
+        return jsonify({"ok": False, "msg": msg})
+    return jsonify({"ok": True, "bot_username": msg})
+
+@app.route(BP + "/admin/tgbots/toggle", methods=["POST"])
+@admin_required
+def admin_tgbots_toggle():
+    data = request.get_json() or {}
+    bot_id = data.get("bot_id")
+    with get_db() as db:
+        row = db.execute("SELECT * FROM tg_bots WHERE id=?", (bot_id,)).fetchone()
+    if not row: return jsonify({"ok": False, "msg": "Not found"})
+    if bot_id in bot_engine.BOT_INSTANCES:
+        bot_engine.stop_bot(bot_id)
+        return jsonify({"ok": True, "status": "stopped"})
+    ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"])
+    return jsonify({"ok": ok, "status": "running" if ok else "stopped", "msg": msg})
+
+@app.route(BP + "/admin/tgbots/delete", methods=["POST"])
+@admin_required
+def admin_tgbots_delete():
+    bot_id = (request.get_json() or {}).get("bot_id")
+    bot_engine.stop_bot(bot_id)
+    with get_db() as db:
+        db.execute("DELETE FROM tg_bots WHERE id=?", (bot_id,))
+        db.execute("DELETE FROM tg_bot_users WHERE bot_id=?", (bot_id,))
+        db.commit()
+    return jsonify({"ok": True})
+
 # ── Telegram Bot API ─────────────────────────────────────────────────────────────
 BOT_SECRET = os.environ.get("BOT_SECRET", "bdx-bot-secret-key")
 
@@ -612,6 +697,7 @@ if __name__ == "__main__":
     init_db()
     _resume_running_panels()
     threading.Thread(target=_periodic_restart_sweep, daemon=True).start()
+    threading.Thread(target=bot_engine.resume_all, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     print(f"[T10-MEHEDI] Listening on :{port}  base={BP or '/'}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)

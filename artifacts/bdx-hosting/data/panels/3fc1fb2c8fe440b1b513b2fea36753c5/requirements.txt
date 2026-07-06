@@ -1,12 +1,2 @@
-requests
-httpx
-google
-protobuf
-pycryptodome
-psutil
-PyJWT
-urllib3
-protobuf-decoder
-pytz
-aiohttp
-cfonts
+python-telegram-bot==21.1.1
+aiohttp==3.10.11

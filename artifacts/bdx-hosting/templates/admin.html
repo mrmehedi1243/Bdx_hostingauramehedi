@@ -141,6 +141,43 @@
     {% endif %}
   </div>
 
+  <!-- Telegram Bot Fleet -->
+  <div class="admin-section">
+    <h2 class="section-title"><i class="fa-brands fa-telegram blue"></i> Telegram Bots</h2>
+    <div class="create-form" id="tgbot-create-form">
+      <div class="form-row">
+        <div class="form-group" style="flex:2;">
+          <label>Bot Token</label>
+          <input type="text" id="tg-token" placeholder="123456:ABC-DEF...">
+        </div>
+        <div class="form-group">
+          <label>Owner Telegram ID</label>
+          <input type="text" id="tg-owner" placeholder="e.g. 6473920581">
+        </div>
+      </div>
+      <button class="btn-primary" onclick="addTgBot()">
+        <i class="fa fa-plus"></i> Add Bot
+      </button>
+      <div id="tgbot-result" class="create-result"></div>
+    </div>
+    <div class="table-wrap" style="margin-top:16px;">
+    <table class="admin-table">
+      <thead>
+        <tr>
+          <th>Bot</th>
+          <th>Owner ID</th>
+          <th>Status</th>
+          <th>Added</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="tgbot-tbody">
+        <tr><td colspan="5" class="empty-state">Loading...</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+
   <!-- Bot API info -->
   <div class="admin-section">
     <h2 class="section-title"><i class="fa fa-robot blue"></i> Telegram Bot API</h2>
@@ -221,6 +258,74 @@ async function extendPanel(id) {
   if (j.ok) { alert(`Extended! New expiry: ${j.expires}`); location.reload(); }
   else { alert(j.msg); }
 }
+
+function tgResult(msg, type) {
+  const el = document.getElementById('tgbot-result');
+  el.innerHTML = msg; el.className = 'create-result ' + type;
+}
+
+async function addTgBot() {
+  const token = document.getElementById('tg-token').value.trim();
+  const owner_admin_id = document.getElementById('tg-owner').value.trim();
+  if (!token || !owner_admin_id) { tgResult('Bot token and owner Telegram ID are both required', 'error'); return; }
+  tgResult('Starting bot...', '');
+  const res = await fetch(BP + '/admin/tgbots/add', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token, owner_admin_id})
+  });
+  const j = await res.json();
+  if (j.ok) {
+    tgResult(`Bot started! @${j.bot_username}`, 'success');
+    document.getElementById('tg-token').value = '';
+    document.getElementById('tg-owner').value = '';
+    loadTgBots();
+  } else {
+    tgResult(j.msg, 'error');
+  }
+}
+
+async function toggleTgBot(id) {
+  const res = await fetch(BP + '/admin/tgbots/toggle', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bot_id: id})
+  });
+  const j = await res.json();
+  if (!j.ok && j.msg) alert(j.msg);
+  loadTgBots();
+}
+
+async function deleteTgBot(id) {
+  if (!confirm('Delete this bot? This cannot be undone.')) return;
+  await fetch(BP + '/admin/tgbots/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bot_id: id})
+  });
+  loadTgBots();
+}
+
+async function loadTgBots() {
+  const res = await fetch(BP + '/admin/tgbots');
+  const j = await res.json();
+  const tbody = document.getElementById('tgbot-tbody');
+  if (!j.ok || !j.bots || !j.bots.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No bots added yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = j.bots.map(b => `
+    <tr>
+      <td><b>${b.bot_username ? '@' + b.bot_username : '(pending)'}</b></td>
+      <td class="blue mono">${b.owner_admin_id}</td>
+      <td>${b.live ? '<span class="badge badge-green">RUNNING</span>' : '<span class="badge badge-gray">STOPPED</span>'}</td>
+      <td class="yellow">${(b.created_at || '').slice(0,10)}</td>
+      <td class="action-td">
+        <button class="btn-sm btn-extend" onclick="toggleTgBot(${b.id})"><i class="fa fa-power-off"></i> ${b.live ? 'Stop' : 'Start'}</button>
+        <button class="btn-sm btn-del" onclick="deleteTgBot(${b.id})"><i class="fa fa-trash"></i></button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+loadTgBots();
 </script>
 
 {% endif %}
