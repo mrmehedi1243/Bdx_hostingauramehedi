@@ -1,5 +1,6 @@
 import os, sys, json, time, uuid, shutil, hashlib, zipfile, secrets, mimetypes
-import sqlite3, threading, subprocess
+import sqlite3, threading, subprocess, socket
+import urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -286,6 +287,17 @@ def _find_missing_script(cmd, pdir):
         return None
     return None
 
+def _find_free_port():
+    """Return an unused local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def _get_public_url(server_id):
+    """Build the public proxy URL for a panel."""
+    host_url = os.environ.get("HOST_URL", "").rstrip("/")
+    return f"{host_url}{BP}/live/{server_id}"
+
 def _start(pid):
     with get_db() as db:
         panel = db.execute("SELECT * FROM panels WHERE id=?", (pid,)).fetchone()
@@ -316,12 +328,19 @@ def _start(pid):
                     push_log(pid, f"[T10] pip: {r.stderr[:300]}")
             except subprocess.TimeoutExpired:
                 push_log(pid, "[T10] pip timed out — starting anyway.")
-    push_log(pid, f"[T10] Starting: {cmd}")
+    # Assign a free port so the user's app can listen on it
+    app_port = _find_free_port()
+    env = os.environ.copy()
+    env["PORT"] = str(app_port)
+    env["HOST"] = "127.0.0.1"
+    push_log(pid, f"[T10] Starting: {cmd}  (PORT={app_port})")
+    push_log(pid, f"[T10] Your app public URL: {_get_public_url(panel['server_id'])}")
+    push_log(pid, "[T10] TIP: In your Flask app use  app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))")
     try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=pdir,
+        proc = subprocess.Popen(cmd, shell=True, cwd=pdir, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         threading.Thread(target=stream_proc, args=(pid, proc), daemon=True).start()
-        PROCESSES[pid] = {"proc": proc, "start_time": time.time()}
+        PROCESSES[pid] = {"proc": proc, "start_time": time.time(), "port": app_port}
         with get_db() as db:
             db.execute("UPDATE panels SET status='running' WHERE id=?", (pid,)); db.commit()
         return True, "Started"
@@ -526,6 +545,89 @@ def public_share(token, filename):
     # Cache public files for 5 minutes
     response.headers["Cache-Control"] = "public, max-age=300"
     return response
+
+# ── Live proxy — public URL for hosted Flask/Node apps ─────────────────────────
+# Accessible at /live/<server_id>  and  /live/<server_id>/<path>
+# No auth required — the URL itself is the access key.
+
+_PROXY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
+    "content-encoding",   # let urllib handle this
+}
+
+def _proxy_request(target_url: str) -> Response:
+    """Forward the current Flask request to target_url and stream back the response."""
+    method  = request.method.upper()
+    body    = request.get_data() or None
+    # Build forwarded headers (skip hop-by-hop)
+    fwd_headers = {k: v for k, v in request.headers if k.lower() not in _PROXY_HOP_HEADERS}
+    fwd_headers["X-Forwarded-For"]   = request.remote_addr or "unknown"
+    fwd_headers["X-Forwarded-Proto"] = request.scheme
+    try:
+        req = urllib.request.Request(target_url, data=body, headers=fwd_headers, method=method)
+        resp = urllib.request.urlopen(req, timeout=30)
+        raw_body = resp.read()
+        status = resp.status
+        resp_headers = {}
+        for k, v in resp.headers.items():
+            if k.lower() not in _PROXY_HOP_HEADERS:
+                resp_headers[k] = v
+        flask_resp = Response(raw_body, status=status, headers=resp_headers)
+        return flask_resp
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        resp_headers = {k: v for k, v in e.headers.items()
+                        if k.lower() not in _PROXY_HOP_HEADERS}
+        return Response(raw, status=e.code, headers=resp_headers)
+    except urllib.error.URLError as e:
+        reason = str(e.reason)
+        html = f"""<!DOCTYPE html><html><head>
+<title>Panel Not Ready</title>
+<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0d1117;color:#c9d1d9}}
+.box{{text-align:center;padding:40px;border:1px solid #30363d;border-radius:12px;max-width:420px}}
+h2{{color:#f85149;margin-bottom:10px}}p{{color:#8b949e;line-height:1.6}}</style></head>
+<body><div class='box'><h2>⚠ App Not Ready</h2>
+<p>Your hosted app isn't responding yet.<br>Make sure it's <b>running</b> and listening on<br>
+<code>host='0.0.0.0', port=int(os.environ.get('PORT',5000))</code></p>
+<p style='margin-top:16px;font-size:12px;color:#6e7681'>Error: {reason}</p></div></body></html>"""
+        return Response(html, status=502, mimetype="text/html")
+
+@app.route(BP + "/live/<server_id>", defaults={"path": ""})
+@app.route(BP + "/live/<server_id>/", defaults={"path": ""})
+@app.route(BP + "/live/<server_id>/<path:path>")
+def proxy_live(server_id, path):
+    with get_db() as db:
+        panel = db.execute("SELECT id FROM panels WHERE server_id=?", (server_id,)).fetchone()
+    if not panel:
+        return "Panel not found", 404
+    pid = panel["id"]
+    proc_info = PROCESSES.get(pid)
+    if not proc_info or "port" not in proc_info:
+        html = """<!DOCTYPE html><html><head><title>Panel Stopped</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;
+min-height:100vh;margin:0;background:#0d1117;color:#c9d1d9}
+.box{text-align:center;padding:40px;border:1px solid #30363d;border-radius:12px;max-width:380px}
+h2{color:#d29922}p{color:#8b949e;line-height:1.6}</style></head>
+<body><div class='box'><h2>Panel is stopped</h2>
+<p>Log in to your panel and press <b>START</b> to bring your app online.</p></div></body></html>"""
+        return Response(html, status=503, mimetype="text/html")
+    port = proc_info["port"]
+    qs   = ("?" + request.query_string.decode()) if request.query_string else ""
+    target = f"http://127.0.0.1:{port}/{path}{qs}"
+    return _proxy_request(target)
+
+@app.route(BP + "/panel/live_url")
+@login_required
+def panel_live_url():
+    pid = session["panel_id"]
+    with get_db() as db:
+        row = db.execute("SELECT server_id FROM panels WHERE id=?", (pid,)).fetchone()
+    if not row: return jsonify({"ok": False})
+    host_url = request.host_url.rstrip("/")
+    url = f"{host_url}{BP}/live/{row['server_id']}"
+    running = pid in PROCESSES and "port" in PROCESSES.get(pid, {})
+    return jsonify({"ok": True, "url": url, "running": running})
 
 @app.route(BP + "/panel/startup", methods=["GET","POST"])
 @login_required

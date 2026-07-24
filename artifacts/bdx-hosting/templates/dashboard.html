@@ -73,10 +73,6 @@
     </div>
     <!-- Stats grid -->
     <div class="stats-grid">
-      <div class="stat-card blue-border">
-        <div class="stat-label">SERVER ADDRESS</div>
-        <div class="stat-val blue" id="server-address">{{ host }}</div>
-      </div>
       <div class="stat-card yellow-border">
         <div class="stat-label">UPTIME</div>
         <div class="stat-val yellow" id="uptime-val">{{ stats.uptime }}</div>
@@ -95,6 +91,20 @@
         <div class="stat-label">CPU / RAM</div>
         <div class="stat-val purple" id="cpu-ram-val">{{ stats.cpu }}% / {{ stats.ram }}MB</div>
       </div>
+    </div>
+
+    <!-- Public URL card (full width) -->
+    <div class="live-url-card" id="live-url-card">
+      <div class="live-url-left">
+        <span class="live-dot" id="live-dot"></span>
+        <div>
+          <div class="live-url-label">PUBLIC URL — Your Flask/Python app is live at:</div>
+          <a class="live-url-val" id="live-url-val" href="#" target="_blank" rel="noopener">Loading...</a>
+        </div>
+      </div>
+      <button class="btn-copy-live" id="btn-copy-live" onclick="copyLiveUrl()">
+        <i class="fa fa-copy"></i> Copy
+      </button>
     </div>
   </div>
 
@@ -174,6 +184,12 @@
           <i class="fa fa-circle-info blue"></i>
           <b>Python:</b> Use <code>python main.py</code> or <code>python bot.py</code> depending on your entry point.
         </div>
+        <div class="info-item">
+          <i class="fa fa-globe green"></i>
+          <b>Flask Public URL:</b> Your app gets a <b>public URL</b> automatically. In your Flask app write:<br>
+          <code>app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))</code><br>
+          Then press START — your app will be live at the Public URL shown in Console tab.
+        </div>
       </div>
     </div>
   </div>
@@ -194,6 +210,7 @@
 <script>
 window.BP = "{{ bp }}";
 window.PANEL_STATUS = "{{ stats.status }}";
+window.SERVER_ID = "{{ panel.server_id }}";
 </script>
 <script src="{{ bp }}/static/js/main.js"></script>
 </body>

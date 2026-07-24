@@ -51,7 +51,7 @@ function startStats() {
     try {
       const j = await (await fetch(BP + "/panel/stats")).json();
       setStatUI(j);
-      if (j.status !== "running") stopStats();
+      if (j.status !== "running") { stopStats(); setLiveUrlUI(false); }
     } catch (_) {}
   }, 2500);
 }
@@ -69,6 +69,45 @@ function setStatUI(j) {
     : '<span class="gray">STOPPED</span>';
 }
 
+/* ── Live/Public URL ─────────────────────────────────────────────── */
+let _liveUrl = "";
+
+async function loadLiveUrl() {
+  try {
+    const j = await (await fetch(BP + "/panel/live_url")).json();
+    if (j.ok) {
+      _liveUrl = j.url;
+      setLiveUrlUI(j.running);
+    }
+  } catch (_) {}
+}
+
+function setLiveUrlUI(running) {
+  const dot  = document.getElementById("live-dot");
+  const link = document.getElementById("live-url-val");
+  const card = document.getElementById("live-url-card");
+  if (!link) return;
+  if (_liveUrl) {
+    link.textContent = _liveUrl;
+    link.href = _liveUrl;
+  }
+  if (dot) {
+    dot.className = "live-dot " + (running ? "live-dot-on" : "live-dot-off");
+    dot.title = running ? "App is running" : "App is stopped";
+  }
+  if (card) card.className = "live-url-card " + (running ? "live-url-running" : "live-url-stopped");
+}
+
+function copyLiveUrl() {
+  if (!_liveUrl) return;
+  navigator.clipboard.writeText(_liveUrl).then(() => {
+    const btn = document.getElementById("btn-copy-live");
+    if (btn) { btn.innerHTML = '<i class="fa fa-check"></i> Copied!'; setTimeout(() => { btn.innerHTML = '<i class="fa fa-copy"></i> Copy'; }, 2000); }
+  }).catch(() => {});
+}
+
+loadLiveUrl();
+
 function setEl(id, text) {
   const el = document.getElementById(id); if (el) el.textContent = text;
 }
@@ -79,7 +118,7 @@ if (window.PANEL_STATUS === "running") startStats();
 async function startPanel() {
   lockBtn("starting");
   const j = await post(BP + "/panel/start");
-  if (j.ok) { lockBtn("running"); startStats(); }
+  if (j.ok) { lockBtn("running"); startStats(); setTimeout(loadLiveUrl, 1500); }
   else       { unlockBtn(); appendLine("[ERROR] " + j.msg); }
 }
 
@@ -87,13 +126,14 @@ async function stopPanel() {
   const j = await post(BP + "/panel/stop");
   unlockBtn(); stopStats();
   setStatUI({ status:"stopped", uptime:"0m 0s", cpu:"0.0", ram:"0" });
+  setLiveUrlUI(false);
 }
 
 async function restartPanel() {
   lockBtn("starting");
-  stopStats();
+  stopStats(); setLiveUrlUI(false);
   const j = await post(BP + "/panel/restart");
-  if (j.ok) { lockBtn("running"); startStats(); }
+  if (j.ok) { lockBtn("running"); startStats(); setTimeout(loadLiveUrl, 1500); }
   else       { unlockBtn(); appendLine("[ERROR] " + (j.msg||"restart failed")); }
 }
 

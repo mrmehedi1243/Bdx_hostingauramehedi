@@ -258,6 +258,41 @@ pre  { font-family: 'Courier New', monospace; }
 .btn-extend    { background: rgba(245,158,11,.1); color: var(--yellow); border: 1px solid rgba(245,158,11,.25); }
 .btn-share     { background: rgba(34,197,94,.1); color: var(--green); border: 1px solid rgba(34,197,94,.25); }
 
+/* ── Live / Public URL card ──────────────────────────────────────── */
+.live-url-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 18px; margin-top: 16px; transition: border-color .3s, background .3s;
+}
+.live-url-running {
+  border-color: rgba(34,197,94,.45);
+  background: rgba(34,197,94,.05);
+}
+.live-url-stopped {
+  border-color: rgba(122,139,168,.2);
+}
+.live-url-left { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.live-url-label { font-size: 11px; color: var(--gray); font-weight: 600; letter-spacing: .5px; text-transform: uppercase; margin-bottom: 4px; }
+.live-url-val {
+  font-size: 13px; color: #8ab4f8; font-family: 'Courier New', monospace;
+  text-decoration: none; word-break: break-all;
+}
+.live-url-val:hover { text-decoration: underline; }
+.live-dot {
+  width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0;
+  transition: background .3s;
+}
+.live-dot-on  { background: var(--green); box-shadow: 0 0 8px rgba(34,197,94,.6); }
+.live-dot-off { background: var(--gray); }
+.btn-copy-live {
+  background: rgba(59,130,246,.15); color: var(--blue-l);
+  border: 1px solid rgba(59,130,246,.3); border-radius: 8px;
+  padding: 8px 16px; font-size: 12px; font-weight: 600; cursor: pointer;
+  font-family: var(--font); display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; transition: opacity .15s; flex-shrink: 0;
+}
+.btn-copy-live:hover { opacity: .8; }
+
 /* ── Share popup ─────────────────────────────────────────────────── */
 .share-popup {
   position: fixed; inset: 0; background: rgba(0,0,0,.72);
