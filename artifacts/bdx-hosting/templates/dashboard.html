@@ -95,16 +95,19 @@
 
     <!-- Public URL card (full width) -->
     <div class="live-url-card" id="live-url-card">
-      <div class="live-url-left">
+      <div class="live-url-top">
         <span class="live-dot" id="live-dot"></span>
-        <div>
-          <div class="live-url-label">PUBLIC URL — Your Flask/Python app is live at:</div>
-          <a class="live-url-val" id="live-url-val" href="#" target="_blank" rel="noopener">Loading...</a>
-        </div>
+        <span class="live-url-label">Public URL &mdash; Share this link, anyone can open your app</span>
+        <a class="live-url-open" id="live-url-open" href="#" target="_blank" rel="noopener" title="Open in new tab">
+          <i class="fa fa-arrow-up-right-from-square"></i>
+        </a>
       </div>
-      <button class="btn-copy-live" id="btn-copy-live" onclick="copyLiveUrl()">
-        <i class="fa fa-copy"></i> Copy
-      </button>
+      <div class="live-url-row">
+        <input class="live-url-input" id="live-url-input" type="text" readonly value="Loading…" onclick="this.select()">
+        <button class="btn-copy-live" id="btn-copy-live" onclick="copyLiveUrl()">
+          <i class="fa fa-copy" id="copy-icon"></i><span id="copy-label">Copy</span>
+        </button>
+      </div>
     </div>
   </div>
 

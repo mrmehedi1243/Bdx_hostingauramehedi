@@ -83,27 +83,34 @@ async function loadLiveUrl() {
 }
 
 function setLiveUrlUI(running) {
-  const dot  = document.getElementById("live-dot");
-  const link = document.getElementById("live-url-val");
-  const card = document.getElementById("live-url-card");
-  if (!link) return;
-  if (_liveUrl) {
-    link.textContent = _liveUrl;
-    link.href = _liveUrl;
-  }
-  if (dot) {
-    dot.className = "live-dot " + (running ? "live-dot-on" : "live-dot-off");
-    dot.title = running ? "App is running" : "App is stopped";
-  }
+  const dot   = document.getElementById("live-dot");
+  const inp   = document.getElementById("live-url-input");
+  const open  = document.getElementById("live-url-open");
+  const card  = document.getElementById("live-url-card");
+  if (inp && _liveUrl)  { inp.value = _liveUrl; }
+  if (open && _liveUrl) { open.href = _liveUrl; }
+  if (dot)  dot.className  = "live-dot " + (running ? "live-dot-on" : "live-dot-off");
   if (card) card.className = "live-url-card " + (running ? "live-url-running" : "live-url-stopped");
 }
 
 function copyLiveUrl() {
   if (!_liveUrl) return;
+  const btn   = document.getElementById("btn-copy-live");
+  const icon  = document.getElementById("copy-icon");
+  const label = document.getElementById("copy-label");
   navigator.clipboard.writeText(_liveUrl).then(() => {
-    const btn = document.getElementById("btn-copy-live");
-    if (btn) { btn.innerHTML = '<i class="fa fa-check"></i> Copied!'; setTimeout(() => { btn.innerHTML = '<i class="fa fa-copy"></i> Copy'; }, 2000); }
-  }).catch(() => {});
+    if (btn)   btn.classList.add("copied");
+    if (icon)  icon.className = "fa fa-check";
+    if (label) label.textContent = "Copied!";
+    setTimeout(() => {
+      if (btn)   btn.classList.remove("copied");
+      if (icon)  icon.className = "fa fa-copy";
+      if (label) label.textContent = "Copy";
+    }, 2200);
+  }).catch(() => {
+    const inp = document.getElementById("live-url-input");
+    if (inp) { inp.select(); document.execCommand("copy"); }
+  });
 }
 
 loadLiveUrl();
