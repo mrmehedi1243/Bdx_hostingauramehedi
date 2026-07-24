@@ -124,8 +124,9 @@
             <td>{{ (f.size / 1024)|round(1) }} KB</td>
             <td>{{ f.modified }}</td>
             <td>
-              <button class="btn-sm btn-view" onclick="viewFile('{{ f.name }}')"><i class="fa fa-eye"></i></button>
-              <button class="btn-sm btn-del"  onclick="deleteFile('{{ f.name }}')"><i class="fa fa-trash"></i></button>
+              <button class="btn-sm btn-view"  onclick="viewFile('{{ f.name }}')"><i class="fa fa-eye"></i></button>
+              <button class="btn-sm btn-share" onclick="shareFile('{{ f.name }}', this)" title="Get public URL"><i class="fa fa-link"></i></button>
+              <button class="btn-sm btn-del"   onclick="deleteFile('{{ f.name }}')"><i class="fa fa-trash"></i></button>
             </td>
           </tr>
           {% else %}
@@ -133,6 +134,20 @@
           {% endfor %}
         </tbody>
       </table>
+    </div>
+
+    <!-- Share URL popup -->
+    <div id="share-popup" class="share-popup hidden">
+      <div class="share-popup-inner">
+        <div class="share-popup-title"><i class="fa fa-link blue"></i> Public File URL</div>
+        <div class="share-url-wrap">
+          <input type="text" id="share-url-input" readonly>
+          <button class="btn-copy" id="btn-copy-url" onclick="copyShareUrl()"><i class="fa fa-copy"></i> Copy</button>
+        </div>
+        <div class="share-popup-hint">Anyone with this link can download the file.</div>
+        <button class="btn-unshare" onclick="unshareFile()"><i class="fa fa-link-slash"></i> Revoke link</button>
+        <button class="share-close" onclick="closeSharePopup()"><i class="fa fa-xmark"></i></button>
+      </div>
     </div>
   </div>
 

@@ -1,11 +1,13 @@
-import os, sys, json, time, uuid, shutil, hashlib, zipfile
+import os, sys, json, time, uuid, shutil, hashlib, zipfile, secrets, mimetypes
 import sqlite3, threading, subprocess
 from datetime import datetime, timedelta
 from functools import wraps
 
 import psutil
 from flask import (Flask, render_template, request, session,
-                   redirect, url_for, jsonify, Response, stream_with_context)
+                   redirect, url_for, jsonify, Response, stream_with_context,
+                   send_file, abort)
+from flask_compress import Compress
 
 import bot_engine
 
@@ -22,6 +24,15 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "bdx-hosting-secret-2025")
 app.config["SESSION_COOKIE_PATH"] = BP + "/" if BP else "/"
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB upload limit
+
+# ── Gzip compression (makes pages 60-80% smaller, much faster) ──────────────
+app.config["COMPRESS_MIMETYPES"] = [
+    "text/html", "text/css", "application/javascript",
+    "application/json", "text/plain"
+]
+app.config["COMPRESS_LEVEL"] = 6
+app.config["COMPRESS_MIN_SIZE"] = 500
+Compress(app)
 
 # ── In-memory process & log stores ─────────────────────────────────────────────
 PROCESSES = {}   # panel_id -> {"proc": Popen, "start_time": float}
@@ -82,6 +93,13 @@ def init_db():
             lang            TEXT NOT NULL DEFAULT 'en',
             created_at      TEXT NOT NULL,
             UNIQUE(bot_id, tg_user_id)
+        );
+        CREATE TABLE IF NOT EXISTS shared_files (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            panel_id   TEXT NOT NULL,
+            filename   TEXT NOT NULL,
+            token      TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
         );
         """)
         # Lightweight migrations for DBs created before these columns existed
@@ -455,6 +473,59 @@ def view_file():
         with open(path,"r",errors="replace") as fh: content = fh.read(60000)
         return jsonify({"ok":True,"content":content})
     except Exception as e: return jsonify({"ok":False,"msg":str(e)})
+
+@app.route(BP + "/panel/file/share", methods=["POST"])
+@login_required
+def share_file():
+    pid  = session["panel_id"]
+    pdir = panel_dir(pid)
+    name = (request.json or {}).get("name","")
+    base = os.path.basename(name)
+    path = os.path.join(pdir, base)
+    if not os.path.isfile(path):
+        return jsonify({"ok":False,"msg":"File not found"})
+    # Return existing token if already shared
+    with get_db() as db:
+        row = db.execute("SELECT token FROM shared_files WHERE panel_id=? AND filename=?",
+                         (pid, base)).fetchone()
+        if row:
+            token = row["token"]
+        else:
+            token = secrets.token_urlsafe(24)
+            db.execute("INSERT INTO shared_files (panel_id,filename,token,created_at) VALUES (?,?,?,?)",
+                       (pid, base, token, datetime.now().isoformat()))
+            db.commit()
+    host = request.host_url.rstrip("/")
+    public_url = f"{host}{BP}/share/{token}/{base}"
+    return jsonify({"ok":True,"url":public_url,"token":token})
+
+@app.route(BP + "/panel/file/unshare", methods=["POST"])
+@login_required
+def unshare_file():
+    pid  = session["panel_id"]
+    name = os.path.basename((request.json or {}).get("name",""))
+    with get_db() as db:
+        db.execute("DELETE FROM shared_files WHERE panel_id=? AND filename=?", (pid, name))
+        db.commit()
+    return jsonify({"ok":True})
+
+# ── Public file serving (no auth required) ──────────────────────────────────
+@app.route(BP + "/share/<token>/<path:filename>")
+def public_share(token, filename):
+    with get_db() as db:
+        row = db.execute("SELECT panel_id, filename FROM shared_files WHERE token=?", (token,)).fetchone()
+    if not row or row["filename"] != os.path.basename(filename):
+        abort(404)
+    filepath = os.path.join(DATA_DIR, row["panel_id"], row["filename"])
+    if not os.path.isfile(filepath):
+        abort(404)
+    mime, _ = mimetypes.guess_type(row["filename"])
+    mime = mime or "application/octet-stream"
+    response = send_file(filepath, mimetype=mime, as_attachment=False,
+                         download_name=row["filename"])
+    # Cache public files for 5 minutes
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return response
 
 @app.route(BP + "/panel/startup", methods=["GET","POST"])
 @login_required

@@ -180,8 +180,9 @@ async function loadFiles() {
       <td>${(f.size/1024).toFixed(1)} KB</td>
       <td>${esc(f.modified)}</td>
       <td>
-        <button class="btn-sm btn-view" onclick="viewFile('${esc(f.name)}')"><i class="fa fa-eye"></i></button>
-        <button class="btn-sm btn-del"  onclick="deleteFile('${esc(f.name)}')"><i class="fa fa-trash"></i></button>
+        <button class="btn-sm btn-view"  onclick="viewFile('${esc(f.name)}')"><i class="fa fa-eye"></i></button>
+        <button class="btn-sm btn-share" onclick="shareFile('${esc(f.name)}', this)" title="Get public URL"><i class="fa fa-link"></i></button>
+        <button class="btn-sm btn-del"   onclick="deleteFile('${esc(f.name)}')"><i class="fa fa-trash"></i></button>
       </td>
     </tr>`).join("");
 }
@@ -191,6 +192,50 @@ async function deleteFile(name) {
   const j = await post(BP + "/panel/file/delete", {name});
   if (j.ok) { document.querySelector(`[data-name="${name}"]`)?.remove(); loadFiles(); }
 }
+
+/* ── File sharing ────────────────────────────────────────────────── */
+let _currentShareName = "";
+
+async function shareFile(name, btn) {
+  btn.disabled = true;
+  const j = await post(BP + "/panel/file/share", {name});
+  btn.disabled = false;
+  if (!j.ok) { alert(j.msg || "Share failed"); return; }
+  _currentShareName = name;
+  document.getElementById("share-url-input").value = j.url;
+  document.getElementById("share-popup").classList.remove("hidden");
+  document.getElementById("btn-copy-url").textContent = "Copy";
+  document.getElementById("btn-copy-url").innerHTML = '<i class="fa fa-copy"></i> Copy';
+}
+
+function closeSharePopup() {
+  document.getElementById("share-popup").classList.add("hidden");
+  _currentShareName = "";
+}
+
+function copyShareUrl() {
+  const inp = document.getElementById("share-url-input");
+  navigator.clipboard.writeText(inp.value).then(() => {
+    const btn = document.getElementById("btn-copy-url");
+    btn.innerHTML = '<i class="fa fa-check"></i> Copied!';
+    setTimeout(() => { btn.innerHTML = '<i class="fa fa-copy"></i> Copy'; }, 2000);
+  }).catch(() => {
+    inp.select(); document.execCommand("copy");
+  });
+}
+
+async function unshareFile() {
+  if (!_currentShareName) return;
+  if (!confirm("Revoke this public link? It will stop working.")) return;
+  await post(BP + "/panel/file/unshare", {name: _currentShareName});
+  closeSharePopup();
+}
+
+// Close share popup on backdrop click
+document.addEventListener("click", e => {
+  const popup = document.getElementById("share-popup");
+  if (popup && !popup.classList.contains("hidden") && e.target === popup) closeSharePopup();
+});
 
 async function viewFile(name) {
   const j = await (await fetch(BP + "/panel/file/view?name=" + encodeURIComponent(name))).json();
