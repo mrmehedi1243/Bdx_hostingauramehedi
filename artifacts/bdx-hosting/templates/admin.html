@@ -111,8 +111,11 @@
       </thead>
       <tbody>
         {% for p in panels %}
-        <tr id="row-{{ p.id }}">
-          <td><b>{{ p.username }}</b></td>
+        <tr id="row-{{ p.id }}" class="{{ 'row-banned' if p.banned else '' }}">
+          <td>
+            <b>{{ p.username }}</b>
+            {% if p.banned %}<span class="badge badge-banned">BANNED</span>{% endif %}
+          </td>
           <td class="blue mono">{{ p.server_id }}</td>
           <td>
             {% if p.runtime_status == 'running' %}
@@ -127,6 +130,18 @@
             <button class="btn-sm btn-extend" onclick="extendPanel('{{ p.id }}')">
               <i class="fa fa-clock"></i> +15d
             </button>
+            <button class="btn-sm btn-reset-pw" onclick="resetPassword('{{ p.id }}', '{{ p.username }}')" title="Reset password">
+              <i class="fa fa-key"></i>
+            </button>
+            {% if p.banned %}
+            <button class="btn-sm btn-unban" onclick="unbanPanel('{{ p.id }}')">
+              <i class="fa fa-unlock"></i> Unban
+            </button>
+            {% else %}
+            <button class="btn-sm btn-ban" onclick="banPanel('{{ p.id }}', '{{ p.username }}')">
+              <i class="fa fa-ban"></i> Ban
+            </button>
+            {% endif %}
             <button class="btn-sm btn-del" onclick="deletePanel('{{ p.id }}', '{{ p.username }}')">
               <i class="fa fa-trash"></i>
             </button>
@@ -250,6 +265,40 @@ async function deletePanel(id, username) {
   const j = await res.json();
   if (j.ok) { document.getElementById('row-' + id)?.remove(); }
   else { alert(j.msg); }
+}
+
+async function banPanel(id, username) {
+  if (!confirm(`Ban "${username}"? They will not be able to login and their panel will stop.`)) return;
+  const res = await fetch(BP + '/admin/ban', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({panel_id: id})
+  });
+  const j = await res.json();
+  if (j.ok) location.reload();
+  else alert(j.msg || 'Failed');
+}
+
+async function unbanPanel(id) {
+  const res = await fetch(BP + '/admin/unban', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({panel_id: id})
+  });
+  const j = await res.json();
+  if (j.ok) location.reload();
+  else alert(j.msg || 'Failed');
+}
+
+async function resetPassword(id, username) {
+  const newPw = prompt(`Reset password for "${username}".\nEnter new password:`);
+  if (!newPw || !newPw.trim()) return;
+  if (newPw.trim().length < 4) { alert('Password must be at least 4 characters'); return; }
+  const res = await fetch(BP + '/admin/reset_password', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({panel_id: id, password: newPw.trim()})
+  });
+  const j = await res.json();
+  if (j.ok) alert(`✓ Password for "${username}" has been reset.`);
+  else alert(j.msg || 'Failed');
 }
 
 async function extendPanel(id) {

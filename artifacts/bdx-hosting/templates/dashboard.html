@@ -61,6 +61,9 @@
     <button class="tab-btn" data-tab="startup" onclick="switchTab('startup', this)">
       <i class="fa fa-rocket"></i> Startup
     </button>
+    <button class="tab-btn" data-tab="settings" onclick="switchTab('settings', this)">
+      <i class="fa fa-gear"></i> Settings
+    </button>
   </div>
 
   <!-- Console Tab -->
@@ -185,15 +188,78 @@
         </div>
         <div class="info-item">
           <i class="fa fa-circle-info blue"></i>
-          <b>Python:</b> Use <code>python main.py</code> or <code>python bot.py</code> depending on your entry point.
+          <b>Any language:</b> <code>python main.py</code>, <code>node index.js</code>, <code>bash run.sh</code> — all work.
         </div>
         <div class="info-item">
           <i class="fa fa-globe green"></i>
-          <b>Flask Public URL:</b> Your app gets a <b>public URL</b> automatically. In your Flask app write:<br>
-          <code>app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))</code><br>
-          Then press START — your app will be live at the Public URL shown in Console tab.
+          <b>Web Apps (Flask/Node/etc):</b> Listen on <code>host='0.0.0.0'</code> and <code>PORT</code> env var — your app gets a public URL automatically.
+        </div>
+        <div class="info-item">
+          <i class="fa fa-file-code blue"></i>
+          <b>Static Sites:</b> Just upload <code>index.html</code> — no START needed. Your public URL serves it directly.
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Settings Tab -->
+  <div id="tab-settings" class="tab-content">
+    <div class="settings-grid">
+
+      <!-- Change Username -->
+      <div class="settings-box">
+        <div class="settings-box-header">
+          <i class="fa fa-user-pen blue"></i>
+          <div>
+            <h3>Change Username</h3>
+            <p class="startup-hint">Current: <b class="blue" id="current-username-label">{{ panel.username }}</b></p>
+          </div>
+        </div>
+        <div class="settings-form">
+          <div class="settings-field">
+            <label>New Username</label>
+            <input type="text" id="un-new" placeholder="Letters, numbers, - and _" autocomplete="off">
+          </div>
+          <div class="settings-field">
+            <label>Current Password (to confirm)</label>
+            <input type="password" id="un-pw" placeholder="Enter your password" autocomplete="current-password">
+          </div>
+          <button class="btn-save-pw" onclick="changeUsername()">
+            <i class="fa fa-floppy-disk"></i> Save Username
+          </button>
+          <div id="un-msg" class="startup-msg" style="margin-top:10px"></div>
+        </div>
+      </div>
+
+      <!-- Change Password -->
+      <div class="settings-box">
+        <div class="settings-box-header">
+          <i class="fa fa-lock blue"></i>
+          <div>
+            <h3>Change Password</h3>
+            <p class="startup-hint">Update your panel login password.</p>
+          </div>
+        </div>
+        <div class="settings-form">
+          <div class="settings-field">
+            <label>Current Password</label>
+            <input type="password" id="pw-old" placeholder="Enter current password" autocomplete="current-password">
+          </div>
+          <div class="settings-field">
+            <label>New Password</label>
+            <input type="password" id="pw-new" placeholder="Min 4 characters" autocomplete="new-password">
+          </div>
+          <div class="settings-field">
+            <label>Confirm New Password</label>
+            <input type="password" id="pw-confirm" placeholder="Repeat new password" autocomplete="new-password">
+          </div>
+          <button class="btn-save-pw" onclick="changePassword()">
+            <i class="fa fa-floppy-disk"></i> Save Password
+          </button>
+          <div id="pw-msg" class="startup-msg" style="margin-top:10px"></div>
+        </div>
+      </div>
+
     </div>
   </div>
 

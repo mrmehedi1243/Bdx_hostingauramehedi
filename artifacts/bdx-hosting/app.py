@@ -70,6 +70,7 @@ def init_db():
             disk_limit    INTEGER NOT NULL DEFAULT 1024,
             start_command TEXT NOT NULL DEFAULT 'python main.py',
             status        TEXT NOT NULL DEFAULT 'stopped',
+            banned        INTEGER NOT NULL DEFAULT 0,
             expires_at    TEXT NOT NULL,
             created_at    TEXT NOT NULL
         );
@@ -104,6 +105,9 @@ def init_db():
         );
         """)
         # Lightweight migrations for DBs created before these columns existed
+        existing_panel_cols = {r["name"] for r in db.execute("PRAGMA table_info(panels)").fetchall()}
+        if "banned" not in existing_panel_cols:
+            db.execute("ALTER TABLE panels ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
         existing_bot_cols = {r["name"] for r in db.execute("PRAGMA table_info(tg_bots)").fetchall()}
         if "force_channel" not in existing_bot_cols:
             db.execute("ALTER TABLE tg_bots ADD COLUMN force_channel TEXT")
@@ -212,6 +216,8 @@ def login():
             row = db.execute("SELECT * FROM panels WHERE username=? AND password=?",
                              (u, hash_pw(p))).fetchone()
         if row:
+            if row["banned"]:
+                return render_template("login.html", error="Your account has been banned. Contact admin.")
             if is_expired(row["expires_at"]):
                 return render_template("login.html", error="Your panel has expired.")
             session.update(panel_id=row["id"], username=row["username"], server_id=row["server_id"])
@@ -261,7 +267,7 @@ def console_stream():
                 last = max(last, log["ts"])
                 yield f"data: {json.dumps({'ts':log['ts'],'line':log['line']})}\n\n"
             if not logs: yield 'data: {"ping":1}\n\n'
-            time.sleep(0.7)
+            time.sleep(1.5)
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
@@ -298,6 +304,37 @@ def _get_public_url(server_id):
     host_url = os.environ.get("HOST_URL", "").rstrip("/")
     return f"{host_url}{BP}/live/{server_id}"
 
+def _stream_pip(pid, req, pdir):
+    """Install requirements.txt and stream each pip output line to the console."""
+    req_hash = hashlib.sha256(open(req, "rb").read()).hexdigest()
+    marker   = os.path.join(pdir, ".requirements_installed")
+    prev     = open(marker).read().strip() if os.path.exists(marker) else None
+    if req_hash == prev:
+        push_log(pid, "[T10] requirements.txt unchanged — skipping reinstall (fast start).")
+        return req_hash
+    push_log(pid, "[T10] Installing requirements.txt …")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", "-r", req,
+             "--break-system-packages", "--no-input", "--no-color"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=pdir
+        )
+        for raw in iter(proc.stdout.readline, ""):
+            line = raw.rstrip()
+            if line: push_log(pid, f"[pip] {line}")
+        proc.wait(timeout=180)
+        if proc.returncode == 0:
+            push_log(pid, "[T10] ✓ Requirements installed successfully.")
+            with open(marker, "w") as mf: mf.write(req_hash)
+            return req_hash
+        push_log(pid, f"[T10] ✗ pip exited with code {proc.returncode} — check output above.")
+    except subprocess.TimeoutExpired:
+        push_log(pid, "[T10] pip timed out — starting anyway.")
+    except Exception as e:
+        push_log(pid, f"[T10] pip error: {e}")
+    return None
+
 def _start(pid):
     with get_db() as db:
         panel = db.execute("SELECT * FROM panels WHERE id=?", (pid,)).fetchone()
@@ -310,32 +347,15 @@ def _start(pid):
         return False, f"{missing} not found — upload your files first"
     req = os.path.join(pdir, "requirements.txt")
     if os.path.exists(req):
-        req_hash = hashlib.sha256(open(req, "rb").read()).hexdigest()
-        marker = os.path.join(pdir, ".requirements_installed")
-        prev_hash = open(marker).read().strip() if os.path.exists(marker) else None
-        if req_hash == prev_hash:
-            push_log(pid, "[T10] requirements.txt unchanged — skipping reinstall (fast start).")
-        else:
-            push_log(pid, "[T10] Installing requirements.txt ...")
-            try:
-                r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", req, "-q",
-                                    "--break-system-packages", "--no-input"],
-                                   capture_output=True, text=True, cwd=pdir, timeout=180)
-                if r.returncode == 0:
-                    push_log(pid, "[T10] Done.")
-                    with open(marker, "w") as mf: mf.write(req_hash)
-                else:
-                    push_log(pid, f"[T10] pip: {r.stderr[:300]}")
-            except subprocess.TimeoutExpired:
-                push_log(pid, "[T10] pip timed out — starting anyway.")
+        _stream_pip(pid, req, pdir)
     # Assign a free port so the user's app can listen on it
     app_port = _find_free_port()
     env = os.environ.copy()
     env["PORT"] = str(app_port)
-    env["HOST"] = "127.0.0.1"
+    env["HOST"] = "0.0.0.0"
     push_log(pid, f"[T10] Starting: {cmd}  (PORT={app_port})")
-    push_log(pid, f"[T10] Your app public URL: {_get_public_url(panel['server_id'])}")
-    push_log(pid, "[T10] TIP: In your Flask app use  app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))")
+    push_log(pid, f"[T10] Public URL: {request.host_url.rstrip('/')}{BP}/live/{panel['server_id']}" if _request_ctx() else _get_public_url(panel['server_id']))
+    push_log(pid, "[T10] For web apps: listen on host='0.0.0.0', port=int(os.environ.get('PORT',5000))")
     try:
         proc = subprocess.Popen(cmd, shell=True, cwd=pdir, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -345,6 +365,12 @@ def _start(pid):
             db.execute("UPDATE panels SET status='running' WHERE id=?", (pid,)); db.commit()
         return True, "Started"
     except Exception as e: return False, str(e)
+
+def _request_ctx():
+    try:
+        from flask import has_request_context
+        return has_request_context()
+    except: return False
 
 @app.route(BP + "/panel/start", methods=["POST"])
 @login_required
@@ -440,24 +466,16 @@ def upload_file():
                 errors.append(f"{name} ZIP error: {e}")
         else:
             uploaded.append(name)
-    auto_msg = None
     req = os.path.join(pdir, "requirements.txt")
+    auto_msg = None
     if os.path.exists(req) and (any("requirements.txt" in u for u in uploaded) or
                                  any("(extracted)" in u for u in uploaded)):
-        try:
-            r = subprocess.run([sys.executable,"-m","pip","install","-r",req,"-q",
-                                "--break-system-packages","--no-input"],
-                               capture_output=True, text=True, cwd=pdir, timeout=180)
-            if r.returncode == 0:
-                auto_msg = "requirements.txt installed"
-                req_hash = hashlib.sha256(open(req, "rb").read()).hexdigest()
-                with open(os.path.join(pdir, ".requirements_installed"), "w") as mf:
-                    mf.write(req_hash)
-            else:
-                auto_msg = f"pip: {r.stderr[:200]}"
-        except subprocess.TimeoutExpired:
-            auto_msg = "pip install timed out — try installing manually via startup command"
-        except Exception as e: auto_msg = f"pip error: {e}"
+        # Run pip in a background thread so upload response returns immediately;
+        # output streams to the panel console if the panel is open.
+        def _bg_install():
+            _stream_pip(pid, req, pdir)
+        threading.Thread(target=_bg_install, daemon=True).start()
+        auto_msg = "Installing requirements.txt in background — watch the Console tab for progress."
     return jsonify({"ok":True,"uploaded":uploaded,"errors":errors,"auto_install":auto_msg})
 
 @app.route(BP + "/panel/files")
@@ -603,19 +621,50 @@ def proxy_live(server_id, path):
         return "Panel not found", 404
     pid = panel["id"]
     proc_info = PROCESSES.get(pid)
-    if not proc_info or "port" not in proc_info:
-        html = """<!DOCTYPE html><html><head><title>Panel Stopped</title>
+
+    # ── If a process is running, proxy to it ────────────────────────
+    if proc_info and "port" in proc_info:
+        port   = proc_info["port"]
+        qs     = ("?" + request.query_string.decode()) if request.query_string else ""
+        target = f"http://127.0.0.1:{port}/{path}{qs}"
+        return _proxy_request(target)
+
+    # ── No running process: try to serve static files directly ──────
+    pdir = panel_dir(pid)
+    # Resolve the requested path to a file
+    req_path  = path.lstrip("/") if path else ""
+    candidates = []
+    if req_path:
+        candidates.append(req_path)
+        # try appending index.html for directory-style URLs
+        candidates.append(req_path.rstrip("/") + "/index.html")
+    # Always try index.html as the fallback root
+    candidates.append("index.html")
+
+    for candidate in candidates:
+        safe = os.path.normpath(candidate)
+        if safe.startswith(".."):
+            continue
+        fpath = os.path.join(pdir, safe)
+        if os.path.isfile(fpath):
+            mime, _ = mimetypes.guess_type(fpath)
+            mime = mime or "application/octet-stream"
+            resp = send_file(fpath, mimetype=mime)
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+
+    # ── Nothing to serve ────────────────────────────────────────────
+    html = """<!DOCTYPE html><html><head><title>Panel Stopped</title>
 <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;
 min-height:100vh;margin:0;background:#0d1117;color:#c9d1d9}
-.box{text-align:center;padding:40px;border:1px solid #30363d;border-radius:12px;max-width:380px}
-h2{color:#d29922}p{color:#8b949e;line-height:1.6}</style></head>
-<body><div class='box'><h2>Panel is stopped</h2>
-<p>Log in to your panel and press <b>START</b> to bring your app online.</p></div></body></html>"""
-        return Response(html, status=503, mimetype="text/html")
-    port = proc_info["port"]
-    qs   = ("?" + request.query_string.decode()) if request.query_string else ""
-    target = f"http://127.0.0.1:{port}/{path}{qs}"
-    return _proxy_request(target)
+.box{text-align:center;padding:40px;border:1px solid #30363d;border-radius:12px;max-width:420px}
+h2{color:#d29922;margin-bottom:10px}p{color:#8b949e;line-height:1.7}code{background:#161b22;
+padding:2px 6px;border-radius:4px;font-size:13px}</style></head>
+<body><div class='box'><h2>⏸ Panel is stopped</h2>
+<p>Log in and press <b>START</b> to bring your app online.</p>
+<p style="font-size:13px">Or upload an <code>index.html</code> to serve a static site — no START needed.</p>
+</div></body></html>"""
+    return Response(html, status=503, mimetype="text/html")
 
 @app.route(BP + "/panel/live_url")
 @login_required
@@ -628,6 +677,50 @@ def panel_live_url():
     url = f"{host_url}{BP}/live/{row['server_id']}"
     running = pid in PROCESSES and "port" in PROCESSES.get(pid, {})
     return jsonify({"ok": True, "url": url, "running": running})
+
+@app.route(BP + "/panel/change_username", methods=["POST"])
+@login_required
+def change_username():
+    pid  = session["panel_id"]
+    data = request.get_json() or {}
+    new_username = (data.get("new_username") or "").strip()
+    password     = (data.get("password") or "").strip()
+    if not new_username or not password:
+        return jsonify({"ok": False, "msg": "Fill in all fields"})
+    if len(new_username) < 3:
+        return jsonify({"ok": False, "msg": "Username must be at least 3 characters"})
+    if not new_username.replace("_","").replace("-","").isalnum():
+        return jsonify({"ok": False, "msg": "Username: only letters, numbers, - and _ allowed"})
+    with get_db() as db:
+        row = db.execute("SELECT password FROM panels WHERE id=?", (pid,)).fetchone()
+        if not row or row["password"] != hash_pw(password):
+            return jsonify({"ok": False, "msg": "Password is incorrect"})
+        try:
+            db.execute("UPDATE panels SET username=? WHERE id=?", (new_username, pid))
+            db.commit()
+        except sqlite3.IntegrityError:
+            return jsonify({"ok": False, "msg": "That username is already taken"})
+    session["username"] = new_username
+    return jsonify({"ok": True, "username": new_username})
+
+@app.route(BP + "/panel/change_password", methods=["POST"])
+@login_required
+def change_password():
+    pid  = session["panel_id"]
+    data = request.get_json() or {}
+    old  = (data.get("old_password") or "").strip()
+    new  = (data.get("new_password") or "").strip()
+    if not old or not new:
+        return jsonify({"ok": False, "msg": "Fill in both fields"})
+    if len(new) < 4:
+        return jsonify({"ok": False, "msg": "New password must be at least 4 characters"})
+    with get_db() as db:
+        row = db.execute("SELECT password FROM panels WHERE id=?", (pid,)).fetchone()
+        if not row or row["password"] != hash_pw(old):
+            return jsonify({"ok": False, "msg": "Current password is wrong"})
+        db.execute("UPDATE panels SET password=? WHERE id=?", (hash_pw(new), pid))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route(BP + "/panel/startup", methods=["GET","POST"])
 @login_required
@@ -662,7 +755,7 @@ def admin_login():
 def admin_dashboard():
     with get_db() as db:
         panels = db.execute("SELECT * FROM panels ORDER BY created_at DESC").fetchall()
-    plist = [{**dict(p),"runtime_status":proc_stats(p["id"])["status"]} for p in panels]
+    plist = [{**dict(p),"runtime_status":proc_stats(p["id"])["status"],"banned":bool(p["banned"])} for p in panels]
     return render_template("admin.html", page="dashboard", panels=plist, admin=session.get("admin_name"))
 
 @app.route(BP + "/admin/create", methods=["POST"])
@@ -685,6 +778,45 @@ def admin_create():
         panel_dir(pid)
         return jsonify({"ok":True,"panel_id":pid,"server_id":sid,"username":u,"password":p,"expires":exp[:10]})
     except sqlite3.IntegrityError: return jsonify({"ok":False,"msg":"Username already exists"})
+
+@app.route(BP + "/admin/ban", methods=["POST"])
+@admin_required
+def admin_ban():
+    data = request.get_json() or {}
+    pid  = data.get("panel_id")
+    if not pid: return jsonify({"ok": False, "msg": "Missing panel_id"})
+    # Stop process if running
+    info = PROCESSES.pop(pid, None)
+    if info:
+        try: info["proc"].terminate(); info["proc"].wait(timeout=5)
+        except: pass
+    with get_db() as db:
+        db.execute("UPDATE panels SET banned=1, status='stopped' WHERE id=?", (pid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route(BP + "/admin/unban", methods=["POST"])
+@admin_required
+def admin_unban():
+    pid = (request.get_json() or {}).get("panel_id")
+    if not pid: return jsonify({"ok": False, "msg": "Missing panel_id"})
+    with get_db() as db:
+        db.execute("UPDATE panels SET banned=0 WHERE id=?", (pid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+@app.route(BP + "/admin/reset_password", methods=["POST"])
+@admin_required
+def admin_reset_password():
+    data = request.get_json() or {}
+    pid  = data.get("panel_id")
+    new_pw = (data.get("password") or "").strip()
+    if not pid or not new_pw:
+        return jsonify({"ok": False, "msg": "Missing fields"})
+    with get_db() as db:
+        db.execute("UPDATE panels SET password=? WHERE id=?", (hash_pw(new_pw), pid))
+        db.commit()
+    return jsonify({"ok": True})
 
 @app.route(BP + "/admin/delete", methods=["POST"])
 @admin_required
@@ -866,11 +998,10 @@ def _resume_running_panels():
         logger_print(f"[T10] resume-on-boot error: {e}")
 
 def _periodic_restart_sweep():
-    """Every RESTART_INTERVAL_SEC, refresh every currently running bot (clean
-    restart) and re-launch any that should be running but aren't. Keeps 24/7
-    bots healthy and self-heals anything that silently died."""
+    """Every 5 minutes: check panels that should be running and revive any that
+    silently died. Does NOT force-kill healthy running processes."""
     while True:
-        time.sleep(RESTART_INTERVAL_SEC)
+        time.sleep(5 * 60)
         try:
             with get_db() as db:
                 rows = db.execute("SELECT id, expires_at FROM panels WHERE status='running'").fetchall()
@@ -878,20 +1009,22 @@ def _periodic_restart_sweep():
                 pid = row["id"]
                 if is_expired(row["expires_at"]):
                     continue
-                info = PROCESSES.pop(pid, None)
+                info = PROCESSES.get(pid)
                 if info:
-                    push_log(pid, "[T10] Scheduled 15-minute refresh restart...")
+                    # Check if the process is still alive
                     try:
-                        info["proc"].terminate(); info["proc"].wait(timeout=5)
+                        if info["proc"].poll() is None:
+                            continue  # still running — leave it alone
                     except Exception:
-                        try: info["proc"].kill()
-                        except Exception: pass
-                else:
-                    push_log(pid, "[T10] Scheduled check found bot not running — restarting...")
+                        pass
+                    # Process object exists but process is dead — clean up
+                    PROCESSES.pop(pid, None)
+                # Not in PROCESSES or dead — needs restart
+                push_log(pid, "[T10] Health check: process not running — auto-restarting...")
                 CRASH_COUNT.pop(pid, None)
                 _start(pid)
         except Exception as e:
-            logger_print(f"[T10] periodic restart sweep error: {e}")
+            logger_print(f"[T10] health-check sweep error: {e}")
 
 def logger_print(msg):
     print(msg, flush=True)

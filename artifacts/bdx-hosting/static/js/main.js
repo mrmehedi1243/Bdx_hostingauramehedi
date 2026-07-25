@@ -53,7 +53,7 @@ function startStats() {
       setStatUI(j);
       if (j.status !== "running") { stopStats(); setLiveUrlUI(false); }
     } catch (_) {}
-  }, 2500);
+  }, 5000);
 }
 
 function stopStats() {
@@ -297,6 +297,45 @@ function closeModal() { document.getElementById("file-modal").classList.add("hid
 document.getElementById("file-modal")?.addEventListener("click", e => {
   if (e.target === e.currentTarget) closeModal();
 });
+
+/* ── Settings ────────────────────────────────────────────────────── */
+async function changeUsername() {
+  const newUn = document.getElementById("un-new")?.value.trim();
+  const pw    = document.getElementById("un-pw")?.value.trim();
+  const msg   = document.getElementById("un-msg");
+  if (!newUn || !pw) { setMsg(msg, "Fill in all fields", "error"); return; }
+  const j = await post(BP + "/panel/change_username", { new_username: newUn, password: pw });
+  if (j.ok) {
+    setMsg(msg, "✓ Username changed to: " + j.username, "success");
+    const lbl = document.getElementById("current-username-label");
+    if (lbl) lbl.textContent = j.username;
+    document.getElementById("un-new").value = "";
+    document.getElementById("un-pw").value  = "";
+  } else {
+    setMsg(msg, j.msg || "Failed", "error");
+  }
+  setTimeout(() => { if (msg) { msg.textContent = ""; msg.className = "startup-msg"; } }, 4000);
+}
+
+async function changePassword() {
+  const old     = document.getElementById("pw-old")?.value.trim();
+  const newPw   = document.getElementById("pw-new")?.value.trim();
+  const confirm = document.getElementById("pw-confirm")?.value.trim();
+  const msg     = document.getElementById("pw-msg");
+  if (!old || !newPw || !confirm) { setMsg(msg, "Fill in all fields", "error"); return; }
+  if (newPw !== confirm)          { setMsg(msg, "New passwords don't match", "error"); return; }
+  if (newPw.length < 4)           { setMsg(msg, "New password must be at least 4 characters", "error"); return; }
+  const j = await post(BP + "/panel/change_password", { old_password: old, new_password: newPw });
+  if (j.ok) {
+    setMsg(msg, "✓ Password changed successfully!", "success");
+    document.getElementById("pw-old").value = "";
+    document.getElementById("pw-new").value = "";
+    document.getElementById("pw-confirm").value = "";
+  } else {
+    setMsg(msg, j.msg || "Failed", "error");
+  }
+  setTimeout(() => { if (msg) { msg.textContent = ""; msg.className = "startup-msg"; } }, 4000);
+}
 
 /* ── Startup ─────────────────────────────────────────────────────── */
 async function saveStartup() {
