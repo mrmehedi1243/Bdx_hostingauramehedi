@@ -160,9 +160,24 @@ async def _is_member(bot, force_channel, user_id):
         return False
 
 
+def _get_login_url():
+    """Build the public login URL from environment variables."""
+    host = os.environ.get("HOST_URL", "").strip().rstrip("/")
+    if not host:
+        dev = os.environ.get("REPLIT_DEV_DOMAIN", "").strip()
+        if dev:
+            host = "https://" + dev
+    bp = os.environ.get("BASE_PATH", "").rstrip("/")
+    return f"{host}{bp}/" if host else None
+
+
 def build_application(bot_id, token, owner_admin_id, force_channel=None):
     application = ApplicationBuilder().token(token).build()
-    bot_ctx = {"owner_admin_id": str(owner_admin_id), "force_channel": force_channel}
+    bot_ctx = {
+        "owner_admin_id": str(owner_admin_id),
+        "force_channel":  force_channel,
+        "bot_id":         bot_id,
+    }
 
     # ── Force-join gate (runs before every other handler) ───────────────────
     async def _gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,6 +223,189 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
         )
 
     application.add_handler(CommandHandler("start", cmd_start))
+
+    # ── Admin-only commands ───────────────────────────────────────────────
+    async def _owner_only(update: Update) -> bool:
+        if not _is_owner(update.effective_user.id, bot_ctx["owner_admin_id"]):
+            await update.effective_message.reply_text("⛔ This command is for the bot owner only.")
+            return False
+        return True
+
+    # /setchannel @channel  — set or update force-join channel live
+    async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        args = context.args
+        if not args:
+            await update.effective_message.reply_text(
+                "Usage: /setchannel @yourchannel\n"
+                "Example: /setchannel @mychannelname\n\n"
+                "Use /removechannel to disable."
+            )
+            return
+        channel = args[0].strip()
+        if not channel.startswith("@") and not channel.startswith("http"):
+            channel = "@" + channel
+        bot_ctx["force_channel"] = channel
+        with _db() as db:
+            db.execute("UPDATE tg_bots SET force_channel=? WHERE id=?", (channel, bot_ctx["bot_id"]))
+            db.commit()
+        await update.effective_message.reply_text(
+            f"✅ Force-join channel set to <b>{channel}</b>\n\n"
+            f"All users must now join that channel to use the bot.",
+            parse_mode="HTML"
+        )
+
+    # /removechannel — disable force-join
+    async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        bot_ctx["force_channel"] = None
+        with _db() as db:
+            db.execute("UPDATE tg_bots SET force_channel=NULL WHERE id=?", (bot_ctx["bot_id"],))
+            db.commit()
+        await update.effective_message.reply_text("✅ Force-join channel removed. Bot is now open to everyone.")
+
+    # /addbalance <user_id> <amount>  — add coins to a user
+    async def cmd_addbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        if len(context.args) < 2:
+            await update.effective_message.reply_text("Usage: /addbalance <user_id> <amount>")
+            return
+        try:
+            target_id = context.args[0].strip()
+            amount    = int(context.args[1])
+            if amount <= 0: raise ValueError
+        except (ValueError, IndexError):
+            await update.effective_message.reply_text("❌ Invalid. Example: /addbalance 123456789 50")
+            return
+        user = _get_user(bot_ctx["bot_id"], target_id)
+        if not user:
+            await update.effective_message.reply_text("❌ User not found. They must /start the bot first.")
+            return
+        with _db() as db:
+            db.execute(
+                "UPDATE tg_bot_users SET balance = balance + ? WHERE bot_id=? AND tg_user_id=?",
+                (amount, bot_ctx["bot_id"], target_id)
+            )
+            db.commit()
+        new_bal = (user.get("balance") or 0) + amount
+        await update.effective_message.reply_text(
+            f"✅ Added <b>{amount} coins</b> to user <code>{target_id}</code>.\n"
+            f"New balance: <b>{new_bal} coins</b>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                int(target_id),
+                f"🎁 <b>You received {amount} coins</b> from the admin!\nNew balance: <b>{new_bal} coins</b>",
+                parse_mode="HTML"
+            )
+        except TelegramError:
+            pass
+
+    # /removebalance <user_id> <amount>
+    async def cmd_removebalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        if len(context.args) < 2:
+            await update.effective_message.reply_text("Usage: /removebalance <user_id> <amount>")
+            return
+        try:
+            target_id = context.args[0].strip()
+            amount    = int(context.args[1])
+            if amount <= 0: raise ValueError
+        except (ValueError, IndexError):
+            await update.effective_message.reply_text("❌ Invalid. Example: /removebalance 123456789 20")
+            return
+        user = _get_user(bot_ctx["bot_id"], target_id)
+        if not user:
+            await update.effective_message.reply_text("❌ User not found.")
+            return
+        new_bal = max(0, (user.get("balance") or 0) - amount)
+        with _db() as db:
+            db.execute(
+                "UPDATE tg_bot_users SET balance=? WHERE bot_id=? AND tg_user_id=?",
+                (new_bal, bot_ctx["bot_id"], target_id)
+            )
+            db.commit()
+        await update.effective_message.reply_text(
+            f"✅ Removed coins. User <code>{target_id}</code> new balance: <b>{new_bal}</b>",
+            parse_mode="HTML"
+        )
+
+    # /broadcast <message>  — send a message to all users
+    async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        if not context.args:
+            await update.effective_message.reply_text("Usage: /broadcast Your message here")
+            return
+        msg = " ".join(context.args)
+        with _db() as db:
+            rows = db.execute(
+                "SELECT tg_user_id FROM tg_bot_users WHERE bot_id=?", (bot_ctx["bot_id"],)
+            ).fetchall()
+        sent = failed = 0
+        for row in rows:
+            try:
+                await context.bot.send_message(
+                    int(row["tg_user_id"]),
+                    f"📢 <b>Admin Broadcast</b>\n\n{msg}",
+                    parse_mode="HTML"
+                )
+                sent += 1
+            except TelegramError:
+                failed += 1
+        await update.effective_message.reply_text(
+            f"✅ Broadcast done.\n✔ Sent: {sent}  ✖ Failed: {failed}"
+        )
+
+    # /users  — list total user count
+    async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        with _db() as db:
+            total = db.execute(
+                "SELECT COUNT(*) n FROM tg_bot_users WHERE bot_id=?", (bot_ctx["bot_id"],)
+            ).fetchone()["n"]
+            latest = db.execute(
+                "SELECT tg_user_id, tg_username, balance, ref_count, created_at "
+                "FROM tg_bot_users WHERE bot_id=? ORDER BY created_at DESC LIMIT 10",
+                (bot_ctx["bot_id"],)
+            ).fetchall()
+        lines = [f"👥 <b>Total Users: {total}</b>\n\n<b>Last 10 joined:</b>"]
+        for r in latest:
+            name = f"@{r['tg_username']}" if r["tg_username"] else f"ID {r['tg_user_id']}"
+            lines.append(f"• {name} — 💰{r['balance']} coins, {r['ref_count']} refs | {(r['created_at'] or '')[:10]}")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # /status  — admin overview
+    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _owner_only(update): return
+        login_url = _get_login_url()
+        fc = bot_ctx.get("force_channel") or "None"
+        with _db() as db:
+            total_users  = db.execute("SELECT COUNT(*) n FROM tg_bot_users WHERE bot_id=?", (bot_ctx["bot_id"],)).fetchone()["n"]
+            total_panels = db.execute("SELECT COALESCE(SUM(panels_created),0) n FROM tg_bot_users WHERE bot_id=?", (bot_ctx["bot_id"],)).fetchone()["n"]
+        await update.effective_message.reply_text(
+            f"📊 <b>Bot Status</b>\n\n"
+            f"👥 Users: <b>{total_users}</b>\n"
+            f"🖥 VPS Created: <b>{total_panels}</b>\n"
+            f"📢 Force Channel: <b>{fc}</b>\n"
+            f"🌐 Panel URL: <code>{login_url or 'Not configured'}</code>\n\n"
+            f"<b>Commands:</b>\n"
+            f"/setchannel @ch — set force-join\n"
+            f"/removechannel — remove force-join\n"
+            f"/addbalance &lt;id&gt; &lt;amt&gt; — give coins\n"
+            f"/removebalance &lt;id&gt; &lt;amt&gt; — remove coins\n"
+            f"/broadcast &lt;msg&gt; — message all users\n"
+            f"/users — user list",
+            parse_mode="HTML"
+        )
+
+    application.add_handler(CommandHandler("setchannel",    cmd_setchannel))
+    application.add_handler(CommandHandler("removechannel", cmd_removechannel))
+    application.add_handler(CommandHandler("addbalance",    cmd_addbalance))
+    application.add_handler(CommandHandler("removebalance", cmd_removebalance))
+    application.add_handler(CommandHandler("broadcast",     cmd_broadcast))
+    application.add_handler(CommandHandler("users",         cmd_users))
+    application.add_handler(CommandHandler("status",        cmd_status))
 
     # ── Check-join callback ──────────────────────────────────────────────
     async def cb_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
