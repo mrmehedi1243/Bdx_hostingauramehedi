@@ -70,8 +70,8 @@
           <input type="text" id="new-password" placeholder="e.g. pass123">
         </div>
         <div class="form-group">
-          <label>Days</label>
-          <input type="number" id="new-days" value="15" min="1">
+          <label>Access</label>
+          <input type="text" value="Lifetime / 24-7" readonly>
         </div>
         <div class="form-group">
           <label>RAM (MB)</label>
@@ -244,7 +244,7 @@ async function createPanel() {
   });
   const j = await res.json();
   if (j.ok) {
-    showResult(`Panel created! Username: <b>${j.username}</b> | Password: <b>${j.password}</b> | Server: <b>${j.server_id}</b> | Expires: <b>${j.expires}</b>`, 'success');
+     showResult(`Panel created! Username: <b>${j.username}</b> | Password: <b>${j.password}</b> | Server: <b>${j.server_id}</b> | Access: <b>Lifetime / 24-7</b>`, 'success');
     setTimeout(() => location.reload(), 2500);
   } else {
     showResult(j.msg, 'error');

@@ -17,6 +17,7 @@ Features:
 - All bot-facing text is in English.
 """
 import os
+import shutil
 import re
 import sqlite3
 import threading
@@ -42,6 +43,7 @@ BOT_INSTANCES = {}   # bot_id -> {"thread": Thread, "stop_flag": Event, "usernam
 REFERRAL_GOAL = 3        # kept for backward compatibility / leaderboard context
 REFERRAL_BONUS = 10      # coins earned per successful referral
 VPS_COST = 30            # coins required to create a panel via the bot
+LIFETIME_EXPIRY = "2300-01-01T00:00:00"
 
 # ── Button layout: 2 columns x 5 rows ────────────────────────────────────────
 BTN_CREATE_VPS   = "\U0001F451 Create VPS"
@@ -619,8 +621,9 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
                 return
             pid = uuid.uuid4().hex
             sid = uuid.uuid4().hex[:8]
-            exp = (datetime.now() + timedelta(days=15)).isoformat()
+            exp = LIFETIME_EXPIRY
             try:
+                os.makedirs(os.path.join(DATA_DIR, pid), exist_ok=False)
                 with _db() as db:
                     _insert_panel_via_bot(db, pid, username, text, sid, exp, bot_id, u.id)
                     if not owner:
@@ -636,16 +639,16 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
                             (bot_id, str(u.id)),
                         )
                     db.commit()
-                _panel_dir(pid)
                 await update.effective_message.reply_text(
                     f"\u2705 <b>VPS created successfully!</b>\n\n"
                     f"\U0001F464 Username: <code>{username}</code>\n"
                     f"\U0001F511 Password: <code>{text}</code>\n"
-                    f"\U0001F4C5 Duration: 15 days\n\n"
+                    f"\U0001F4C5 Duration: <b>Lifetime / 24-7</b>\n\n"
                     f"Log in to the panel to upload and run your bot.",
                     parse_mode="HTML",
                 )
             except sqlite3.IntegrityError:
+                shutil.rmtree(os.path.join(DATA_DIR, pid), ignore_errors=True)
                 await update.effective_message.reply_text(
                     "\u274C This username is already taken. Tap \u201cCreate VPS\u201d again with a different username."
                 )

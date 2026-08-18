@@ -13,10 +13,16 @@ from flask_compress import Compress
 import bot_engine
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR  = os.path.join(BASE_DIR, "data", "panels")
-DB_PATH   = os.path.join(BASE_DIR, "data", "bdx.db")
+# Keep mutable panel data outside code paths and allow deployments to provide a
+# persistent mount. The workspace path remains the safe local default.
+PERSISTENT_DATA_ROOT = os.environ.get(
+    "PANEL_DATA_ROOT", os.path.join(BASE_DIR, "data")
+)
+DATA_DIR  = os.path.join(PERSISTENT_DATA_ROOT, "panels")
+DB_PATH   = os.path.join(PERSISTENT_DATA_ROOT, "bdx.db")
 os.makedirs(DATA_DIR, exist_ok=True)
 bot_engine.init(DB_PATH, DATA_DIR)
+LIFETIME_EXPIRY = "2300-01-01T00:00:00"
 
 # Base path prefix (set via env on Replit, empty string on bare VPS)
 BP = os.environ.get("BASE_PATH", "").rstrip("/")   # e.g. "/bdx" or ""
@@ -54,6 +60,9 @@ def get_db():
 
 def init_db():
     with get_db() as db:
+        db.execute("PRAGMA busy_timeout=10000")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
         db.executescript("""
         CREATE TABLE IF NOT EXISTS admins (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,11 +130,40 @@ def init_db():
         db.execute("INSERT OR IGNORE INTO admins (username,password) VALUES (?,?)", ("mehedi", pw))
         db.commit()
 
+# Gunicorn imports `app` instead of executing this module as a script.
+# Initialize the persistent schema on import as well as on direct startup.
+init_db()
+
 def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def panel_dir(pid): d = os.path.join(DATA_DIR, pid); os.makedirs(d, exist_ok=True); return d
 def is_expired(exp):
     try: return datetime.fromisoformat(exp) < datetime.now()
     except: return True
+
+def panel_is_active(panel):
+    """Panels are admin-managed now; expiry is informational only.
+
+    Existing panels created with the old trial expiry must not suddenly
+    disappear or stop after a restart. Ban/delete are the explicit controls.
+    """
+    return bool(panel) and not bool(panel["banned"])
+
+def repair_panel_storage():
+    """Recreate missing panel directories after a managed app restart.
+
+    A missing directory must never make the panel record look deleted. Files
+    that were already persisted remain untouched; this only repairs the
+    container directory itself.
+    """
+    try:
+        with get_db() as db:
+            rows = db.execute("SELECT id FROM panels").fetchall()
+        for row in rows:
+            os.makedirs(os.path.join(DATA_DIR, row["id"]), exist_ok=True)
+    except Exception as exc:
+        print(f"[T10] storage repair warning: {exc}", flush=True)
+
+repair_panel_storage()
 
 # ── Auth decorators ─────────────────────────────────────────────────────────────
 def login_required(f):
@@ -186,23 +224,21 @@ def stream_proc(pid, proc):
     if still_tracked:
         PROCESSES.pop(pid, None)
     if still_tracked:
-        # Process exited on its own (not via manual STOP) — treat as a crash and
-        # auto-restart so 24/7-hosted bots stay online.
+        # Process exited on its own (not via manual STOP). Keep retrying so a
+        # temporary dependency/network failure cannot permanently take a panel
+        # offline. A manual STOP removes the process from PROCESSES first.
         n = CRASH_COUNT.get(pid, 0) + 1
         CRASH_COUNT[pid] = n
-        if n <= 20:
-            delay = min(30, 2 * n)
-            push_log(pid, f"[T10] Unexpected exit — auto-restarting in {delay}s (attempt {n})...")
-            def _delayed_restart():
-                time.sleep(delay)
-                with get_db() as db:
-                    row = db.execute("SELECT expires_at FROM panels WHERE id=?", (pid,)).fetchone()
-                if row and not is_expired(row["expires_at"]) and pid not in PROCESSES:
-                    _start(pid)
-            threading.Thread(target=_delayed_restart, daemon=True).start()
-            return
-        else:
-            push_log(pid, "[T10] Too many crashes — giving up auto-restart. Check your code and press START manually.")
+        delay = min(60, max(2, 2 * n))
+        push_log(pid, f"[T10] Unexpected exit — auto-restarting in {delay}s (attempt {n})...")
+        def _delayed_restart():
+            time.sleep(delay)
+            with get_db() as db:
+                row = db.execute("SELECT * FROM panels WHERE id=?", (pid,)).fetchone()
+            if row and panel_is_active(row) and pid not in PROCESSES:
+                _start(pid)
+        threading.Thread(target=_delayed_restart, daemon=True).start()
+        return
     with get_db() as db:
         db.execute("UPDATE panels SET status='stopped' WHERE id=?", (pid,)); db.commit()
 
@@ -218,8 +254,6 @@ def login():
         if row:
             if row["banned"]:
                 return render_template("login.html", error="Your account has been banned. Contact admin.")
-            if is_expired(row["expires_at"]):
-                return render_template("login.html", error="Your panel has expired.")
             session.update(panel_id=row["id"], username=row["username"], server_id=row["server_id"])
             return redirect(BP + "/dashboard")
         return render_template("login.html", error="Invalid username or password.")
@@ -339,7 +373,7 @@ def _start(pid):
     with get_db() as db:
         panel = db.execute("SELECT * FROM panels WHERE id=?", (pid,)).fetchone()
     if not panel: return False, "Panel not found"
-    if is_expired(panel["expires_at"]): return False, "Panel expired"
+    if panel["banned"]: return False, "This panel is banned"
     pdir = panel_dir(pid); cmd = panel["start_command"]
     missing = _find_missing_script(cmd, pdir)
     if missing:
@@ -357,8 +391,11 @@ def _start(pid):
     push_log(pid, f"[T10] Public URL: {request.host_url.rstrip('/')}{BP}/live/{panel['server_id']}" if _request_ctx() else _get_public_url(panel['server_id']))
     push_log(pid, "[T10] For web apps: listen on host='0.0.0.0', port=int(os.environ.get('PORT',5000))")
     try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=pdir, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=pdir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         threading.Thread(target=stream_proc, args=(pid, proc), daemon=True).start()
         PROCESSES[pid] = {"proc": proc, "start_time": time.time(), "port": app_port}
         with get_db() as db:
@@ -763,21 +800,28 @@ def admin_dashboard():
 def admin_create():
     data = request.get_json() or request.form
     u = (data.get("username") or "").strip(); p = (data.get("password") or "").strip()
-    days = int(data.get("days") or 15); ram = int(data.get("ram") or 512)
+    ram = int(data.get("ram") or 512)
     disk = int(data.get("disk") or 1024); cmd = (data.get("start_command") or "python main.py").strip()
     if not u or not p: return jsonify({"ok":False,"msg":"Username and password required"})
     pid = uuid.uuid4().hex; sid = uuid.uuid4().hex[:8]
-    exp = (datetime.now()+timedelta(days=days)).isoformat()
+    # Hosting is lifetime/24-7. Admin ban or delete are the only controls that
+    # should disable or remove a panel.
+    exp = LIFETIME_EXPIRY
     try:
+        os.makedirs(os.path.join(DATA_DIR, pid), exist_ok=False)
         with get_db() as db:
             db.execute("""INSERT INTO panels
                 (id,username,password,server_id,type,ram_limit,disk_limit,start_command,status,expires_at,created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (pid,u,hash_pw(p),sid,"python",ram,disk,cmd,"stopped",exp,datetime.now().isoformat()))
             db.commit()
-        panel_dir(pid)
-        return jsonify({"ok":True,"panel_id":pid,"server_id":sid,"username":u,"password":p,"expires":exp[:10]})
-    except sqlite3.IntegrityError: return jsonify({"ok":False,"msg":"Username already exists"})
+        return jsonify({"ok":True,"panel_id":pid,"server_id":sid,"username":u,"password":p,"expires":"Lifetime"})
+    except sqlite3.IntegrityError:
+        shutil.rmtree(os.path.join(DATA_DIR, pid), ignore_errors=True)
+        return jsonify({"ok":False,"msg":"Username already exists"})
+    except Exception as exc:
+        shutil.rmtree(os.path.join(DATA_DIR, pid), ignore_errors=True)
+        return jsonify({"ok":False,"msg":f"Panel storage error: {exc}"})
 
 @app.route(BP + "/admin/ban", methods=["POST"])
 @admin_required
@@ -978,18 +1022,13 @@ def custom_static(filename):
 RESTART_INTERVAL_SEC = 15 * 60  # 15 minutes, per user request
 
 def _resume_running_panels():
-    """Called on boot (and can't hurt to re-check periodically): any panel whose
-    DB status is 'running' but whose process isn't actually alive in this process
-    gets (re)started. This is what makes hosted bots survive a server reboot,
-    code deploy, or crash — without it a bot looks 'gone' until you press START."""
+    """Resume every non-banned panel marked running in the persistent DB."""
     try:
         with get_db() as db:
-            rows = db.execute("SELECT id, expires_at FROM panels WHERE status='running'").fetchall()
+            rows = db.execute("SELECT * FROM panels WHERE status='running' AND banned=0").fetchall()
         for row in rows:
             pid = row["id"]
             if pid in PROCESSES:
-                continue
-            if is_expired(row["expires_at"]):
                 continue
             push_log(pid, "[T10] Server restarted — auto-resuming your bot...")
             CRASH_COUNT.pop(pid, None)
@@ -1004,11 +1043,9 @@ def _periodic_restart_sweep():
         time.sleep(5 * 60)
         try:
             with get_db() as db:
-                rows = db.execute("SELECT id, expires_at FROM panels WHERE status='running'").fetchall()
+                rows = db.execute("SELECT * FROM panels WHERE status='running' AND banned=0").fetchall()
             for row in rows:
                 pid = row["id"]
-                if is_expired(row["expires_at"]):
-                    continue
                 info = PROCESSES.get(pid)
                 if info:
                     # Check if the process is still alive
@@ -1032,6 +1069,7 @@ def logger_print(msg):
 # ── Boot ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
+    repair_panel_storage()
     _resume_running_panels()
     threading.Thread(target=_periodic_restart_sweep, daemon=True).start()
     threading.Thread(target=bot_engine.resume_all, daemon=True).start()
