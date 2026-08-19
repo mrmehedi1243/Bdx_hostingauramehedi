@@ -166,8 +166,12 @@
           <input type="text" id="tg-token" placeholder="123456:ABC-DEF...">
         </div>
         <div class="form-group">
-          <label>Owner Telegram ID</label>
+          <label>Owner Telegram ID <span style="opacity:.65;">(optional)</span></label>
           <input type="text" id="tg-owner" placeholder="e.g. 6473920581">
+        </div>
+        <div class="form-group">
+          <label>Owner Telegram Username <span style="opacity:.65;">(optional)</span></label>
+          <input type="text" id="tg-owner-username" placeholder="e.g. mehedi or @mehedi">
         </div>
         <div class="form-group">
           <label>Force Join Channel (optional)</label>
@@ -184,7 +188,7 @@
       <thead>
         <tr>
           <th>Bot</th>
-          <th>Owner ID</th>
+          <th>Owner</th>
           <th>Force Channel</th>
           <th>Status</th>
           <th>Added</th>
@@ -321,18 +325,22 @@ function tgResult(msg, type) {
 async function addTgBot() {
   const token = document.getElementById('tg-token').value.trim();
   const owner_admin_id = document.getElementById('tg-owner').value.trim();
+  const owner_admin_username = document.getElementById('tg-owner-username').value.trim().replace(/^@/, '');
   const force_channel = document.getElementById('tg-channel').value.trim();
-  if (!token || !owner_admin_id) { tgResult('Bot token and owner Telegram ID are both required', 'error'); return; }
+  if (!token || (!owner_admin_id && !owner_admin_username)) {
+    tgResult('Bot token and an owner Telegram ID or username are required', 'error'); return;
+  }
   tgResult('Starting bot...', '');
   const res = await fetch(BP + '/admin/tgbots/add', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({token, owner_admin_id, force_channel})
+    body: JSON.stringify({token, owner_admin_id, owner_admin_username, force_channel})
   });
   const j = await res.json();
   if (j.ok) {
     tgResult(`Bot started! @${j.bot_username}`, 'success');
     document.getElementById('tg-token').value = '';
     document.getElementById('tg-owner').value = '';
+    document.getElementById('tg-owner-username').value = '';
     document.getElementById('tg-channel').value = '';
     loadTgBots();
   } else {
@@ -379,13 +387,16 @@ async function loadTgBots() {
     tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No bots added yet.</td></tr>';
     return;
   }
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[c]));
   tbody.innerHTML = j.bots.map(b => `
     <tr>
-      <td><b>${b.bot_username ? '@' + b.bot_username : '(pending)'}</b></td>
-      <td class="blue mono">${b.owner_admin_id}</td>
+      <td><b>${b.bot_username ? '@' + esc(b.bot_username) : '(pending)'}</b></td>
+      <td class="blue mono">${b.owner_admin_username ? '@' + esc(b.owner_admin_username) : ''}${b.owner_admin_username && b.owner_admin_id ? ' · ' : ''}${b.owner_admin_id ? 'ID ' + esc(b.owner_admin_id) : '<i>username only</i>'}</td>
       <td class="mono">
-        <span>${b.force_channel ? b.force_channel : '<i>none</i>'}</span>
-        <button class="btn-sm btn-extend" onclick="editTgChannel(${b.id}, '${(b.force_channel||'').replace(/'/g,"")}')"><i class="fa fa-pen"></i></button>
+        <span>${b.force_channel ? esc(b.force_channel) : '<i>none</i>'}</span>
+        <button class="btn-sm btn-extend" onclick="editTgChannel(${b.id}, ${JSON.stringify(b.force_channel || '')})"><i class="fa fa-pen"></i></button>
       </td>
       <td>${b.live ? '<span class="badge badge-green">RUNNING</span>' : '<span class="badge badge-gray">STOPPED</span>'}</td>
       <td class="yellow">${(b.created_at || '').slice(0,10)}</td>

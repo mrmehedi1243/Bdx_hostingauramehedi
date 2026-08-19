@@ -204,6 +204,11 @@ async function uploadFiles(files) {
   if (j.ok) {
     let txt = "Uploaded: " + j.uploaded.join(", ");
     if (j.auto_install) txt += "  |  pip: " + j.auto_install;
+    if (j.startup_command) {
+      const startup = document.getElementById("startup-cmd");
+      if (startup) startup.value = j.startup_command;
+      txt += "  |  startup: " + j.startup_command;
+    }
     if (j.errors.length) txt += "  |  Errors: " + j.errors.join(", ");
     setMsg(msg, txt, "success");
     loadFiles();
@@ -227,6 +232,7 @@ async function loadFiles() {
       <td>${(f.size/1024).toFixed(1)} KB</td>
       <td>${esc(f.modified)}</td>
       <td>
+        <a class="btn-sm btn-download" href="${BP}/panel/file/download?name=${encodeURIComponent(f.name)}" title="Download file"><i class="fa fa-download"></i></a>
         <button class="btn-sm btn-view"  onclick="viewFile('${esc(f.name)}')"><i class="fa fa-eye"></i></button>
         <button class="btn-sm btn-share" onclick="shareFile('${esc(f.name)}', this)" title="Get public URL"><i class="fa fa-link"></i></button>
         <button class="btn-sm btn-del"   onclick="deleteFile('${esc(f.name)}')"><i class="fa fa-trash"></i></button>

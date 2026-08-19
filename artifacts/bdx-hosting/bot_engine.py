@@ -24,6 +24,7 @@ import threading
 import asyncio
 import uuid
 import hashlib
+from html import escape as html_escape
 from datetime import datetime, timedelta
 
 from telegram import (
@@ -93,8 +94,19 @@ def _main_keyboard():
     return ReplyKeyboardMarkup(MAIN_MENU_LAYOUT, resize_keyboard=True, one_time_keyboard=False)
 
 
-def _is_owner(user_id, owner_admin_id):
-    return str(user_id) == str(owner_admin_id)
+def _is_owner(user_id, owner_admin_id=None, user_username=None, owner_admin_username=None):
+    """Match the configured owner by Telegram ID or username.
+
+    The numeric ID remains supported for existing bots. Usernames are compared
+    case-insensitively and work whether the configured value includes "@"
+    or not.
+    """
+    configured_id = str(owner_admin_id or "").strip()
+    if configured_id and str(user_id) == configured_id:
+        return True
+    configured_username = str(owner_admin_username or "").strip().lstrip("@").lower()
+    actual_username = str(user_username or "").strip().lstrip("@").lower()
+    return bool(configured_username and actual_username and configured_username == actual_username)
 
 
 def _get_or_create_user(bot_id, tg_user, referred_by=None):
@@ -164,28 +176,38 @@ async def _is_member(bot, force_channel, user_id):
 
 def _get_login_url():
     """Build the public login URL from environment variables."""
-    host = os.environ.get("HOST_URL", "").strip().rstrip("/")
+    host = (
+        os.environ.get("HOST_URL", "").strip()
+        or os.environ.get("PUBLIC_URL", "").strip()
+        or os.environ.get("REPLIT_DEV_DOMAIN", "").strip()
+    ).rstrip("/")
     if not host:
-        dev = os.environ.get("REPLIT_DEV_DOMAIN", "").strip()
-        if dev:
-            host = "https://" + dev
+        return None
+    if not host.startswith(("http://", "https://")):
+        host = "https://" + host
     bp = os.environ.get("BASE_PATH", "").rstrip("/")
     return f"{host}{bp}/" if host else None
 
 
-def build_application(bot_id, token, owner_admin_id, force_channel=None):
+def build_application(bot_id, token, owner_admin_id, force_channel=None, owner_admin_username=None):
     application = ApplicationBuilder().token(token).build()
     bot_ctx = {
-        "owner_admin_id": str(owner_admin_id),
-        "force_channel":  force_channel,
-        "bot_id":         bot_id,
+        "owner_admin_id":       str(owner_admin_id or "").strip(),
+        "owner_admin_username": str(owner_admin_username or "").strip().lstrip("@"),
+        "force_channel":        force_channel,
+        "bot_id":               bot_id,
     }
 
     # ── Force-join gate (runs before every other handler) ───────────────────
     async def _gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fc = bot_ctx["force_channel"]
         user = update.effective_user
-        if not fc or not user or _is_owner(user.id, bot_ctx["owner_admin_id"]):
+        if not fc or not user or _is_owner(
+            user.id,
+            bot_ctx["owner_admin_id"],
+            user.username,
+            bot_ctx["owner_admin_username"],
+        ):
             return
         if await _is_member(context.bot, fc, user.id):
             return
@@ -228,7 +250,13 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
 
     # ── Admin-only commands ───────────────────────────────────────────────
     async def _owner_only(update: Update) -> bool:
-        if not _is_owner(update.effective_user.id, bot_ctx["owner_admin_id"]):
+        user = update.effective_user
+        if not _is_owner(
+            user.id,
+            bot_ctx["owner_admin_id"],
+            user.username,
+            bot_ctx["owner_admin_username"],
+        ):
             await update.effective_message.reply_text("⛔ This command is for the bot owner only.")
             return False
         return True
@@ -252,7 +280,7 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
             db.execute("UPDATE tg_bots SET force_channel=? WHERE id=?", (channel, bot_ctx["bot_id"]))
             db.commit()
         await update.effective_message.reply_text(
-            f"✅ Force-join channel set to <b>{channel}</b>\n\n"
+            f"✅ Force-join channel set to <b>{html_escape(channel)}</b>\n\n"
             f"All users must now join that channel to use the bot.",
             parse_mode="HTML"
         )
@@ -428,7 +456,12 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
     async def btn_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = update.effective_user
         user = _get_user(bot_id, u.id) or {}
-        owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+        owner = _is_owner(
+            u.id,
+            bot_ctx["owner_admin_id"],
+            u.username,
+            bot_ctx["owner_admin_username"],
+        )
         balance = "\u221E Unlimited (Admin)" if owner else f"{user.get('balance', 0)} coins"
         await update.effective_message.reply_text(
             f"\U0001F464 <b>My Profile</b>\n\n"
@@ -469,17 +502,27 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
             )
             return
         lines = [f"\U0001F310 <b>My VPS ({len(rows)})</b>\n"]
+        login_url = _get_login_url()
         for p in rows:
+            # The panel login page is the artifact root ("/"), not a
+            # separate "/login" route.
+            panel_url = login_url or "Panel URL unavailable"
             lines.append(
-                f"\u2022 <b>{p['username']}</b> | Server: <code>{p['server_id']}</code> | "
-                f"Status: {p['status']} | Expires: {p['expires_at'][:10]}"
+                f"\u2022 <b>{html_escape(p['username'])}</b> | Server: <code>{html_escape(p['server_id'])}</code>\n"
+                f"  Status: <b>{html_escape(p['status'])}</b> | Access: <b>24/7</b>\n"
+                f"  Panel: <a href=\"{html_escape(panel_url, quote=True)}\">Open panel</a>"
             )
         await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
     # ── Button: Create VPS (starts a text conversation) ─────────────────
     async def btn_create_vps(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = update.effective_user
-        owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+        owner = _is_owner(
+            u.id,
+            bot_ctx["owner_admin_id"],
+            u.username,
+            bot_ctx["owner_admin_username"],
+        )
         user = _get_user(bot_id, u.id) or {}
         if not owner and (user.get("balance", 0) or 0) < VPS_COST:
             need = VPS_COST - (user.get("balance", 0) or 0)
@@ -535,7 +578,7 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
     async def btn_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "\U0001F6D2 <b>Store</b>\n\n"
-            f"\u2022 <b>Standard VPS</b> — {VPS_COST} coins (512MB RAM, 1GB Disk, 15 days)\n\n"
+            f"\u2022 <b>Standard VPS</b> — {VPS_COST} coins (512MB RAM, 1GB Disk, Lifetime / 24-7)\n\n"
             "Earn coins with \u201cRefer & Earn\u201d, then tap \u201cCreate VPS\u201d to redeem.",
             parse_mode="HTML",
         )
@@ -614,7 +657,12 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
                 return
             username = context.user_data.pop("pending_username", None)
             context.user_data.pop("pending", None)
-            owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+            owner = _is_owner(
+                u.id,
+                bot_ctx["owner_admin_id"],
+                u.username,
+                bot_ctx["owner_admin_username"],
+            )
             user = _get_user(bot_id, u.id) or {}
             if not owner and (user.get("balance", 0) or 0) < VPS_COST:
                 await update.effective_message.reply_text("\U0001F512 You no longer have enough coins for this VPS.")
@@ -639,12 +687,15 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
                             (bot_id, str(u.id)),
                         )
                     db.commit()
+                login_url = _get_login_url()
                 await update.effective_message.reply_text(
                     f"\u2705 <b>VPS created successfully!</b>\n\n"
-                    f"\U0001F464 Username: <code>{username}</code>\n"
-                    f"\U0001F511 Password: <code>{text}</code>\n"
+                    f"\U0001F310 Panel URL: <a href=\"{html_escape(login_url or '#', quote=True)}\">"
+                    f"{html_escape(login_url or 'Unavailable')}</a>\n"
+                    f"\U0001F464 Username: <code>{html_escape(username)}</code>\n"
+                    f"\U0001F511 Password: <code>{html_escape(text)}</code>\n"
                     f"\U0001F4C5 Duration: <b>Lifetime / 24-7</b>\n\n"
-                    f"Log in to the panel to upload and run your bot.",
+                    f"Use the panel URL and these credentials to upload and run your bot.",
                     parse_mode="HTML",
                 )
             except sqlite3.IntegrityError:
@@ -677,7 +728,12 @@ def build_application(bot_id, token, owner_admin_id, force_channel=None):
             amount = int(text)
             target_id = context.user_data.pop("transfer_target", None)
             context.user_data.pop("pending", None)
-            owner = _is_owner(u.id, bot_ctx["owner_admin_id"])
+            owner = _is_owner(
+                u.id,
+                bot_ctx["owner_admin_id"],
+                u.username,
+                bot_ctx["owner_admin_username"],
+            )
             sender = _get_user(bot_id, u.id) or {}
             if not owner and (sender.get("balance", 0) or 0) < amount:
                 await update.effective_message.reply_text("\U0001F512 You don't have enough coins for this transfer.")
@@ -745,7 +801,7 @@ def _insert_panel_via_bot(db, pid, username, password, sid, exp, bot_id, tg_user
     )
 
 
-def start_bot(bot_id, token, owner_admin_id, force_channel=None):
+def start_bot(bot_id, token, owner_admin_id, force_channel=None, owner_admin_username=None):
     if bot_id in BOT_INSTANCES:
         return True, "Already running"
 
@@ -758,7 +814,13 @@ def start_bot(bot_id, token, owner_admin_id, force_channel=None):
         asyncio.set_event_loop(loop)
         application = None
         try:
-            application = build_application(bot_id, token, owner_admin_id, force_channel)
+            application = build_application(
+                bot_id,
+                token,
+                owner_admin_id,
+                force_channel,
+                owner_admin_username,
+            )
             loop.run_until_complete(application.initialize())
             me = loop.run_until_complete(application.bot.get_me())
             result["username"] = me.username
@@ -817,6 +879,12 @@ def resume_all():
         with _db() as db:
             rows = db.execute("SELECT * FROM tg_bots WHERE status='running'").fetchall()
         for row in rows:
-            start_bot(row["id"], row["token"], row["owner_admin_id"], row["force_channel"])
+            start_bot(
+                row["id"],
+                row["token"],
+                row["owner_admin_id"],
+                row["force_channel"],
+                owner_admin_username=row["owner_admin_username"],
+            )
     except Exception as e:
         print(f"[T10-BOT] resume_all error: {e}", flush=True)

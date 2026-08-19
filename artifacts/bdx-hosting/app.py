@@ -1,6 +1,6 @@
 import os, sys, json, time, uuid, shutil, hashlib, zipfile, secrets, mimetypes
 import sqlite3, threading, subprocess, socket
-import urllib.request, urllib.error, urllib.parse
+import urllib.request, urllib.error, urllib.parse, posixpath
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -87,6 +87,7 @@ def init_db():
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             token           TEXT UNIQUE NOT NULL,
             owner_admin_id  TEXT NOT NULL,
+            owner_admin_username TEXT,
             bot_username    TEXT,
             status          TEXT NOT NULL DEFAULT 'stopped',
             force_channel   TEXT,
@@ -118,6 +119,8 @@ def init_db():
         if "banned" not in existing_panel_cols:
             db.execute("ALTER TABLE panels ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
         existing_bot_cols = {r["name"] for r in db.execute("PRAGMA table_info(tg_bots)").fetchall()}
+        if "owner_admin_username" not in existing_bot_cols:
+            db.execute("ALTER TABLE tg_bots ADD COLUMN owner_admin_username TEXT")
         if "force_channel" not in existing_bot_cols:
             db.execute("ALTER TABLE tg_bots ADD COLUMN force_channel TEXT")
         existing_user_cols = {r["name"] for r in db.execute("PRAGMA table_info(tg_bot_users)").fetchall()}
@@ -473,6 +476,50 @@ def _safe_extract(zf, pdir):
             continue  # skip zip-slip / path traversal entries
         zf.extract(member, pdir)
 
+def _panel_relative_name(name):
+    """Normalize a panel file path and reject traversal attempts."""
+    raw = str(name or "").replace("\\", "/").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    normalized = posixpath.normpath(raw)
+    if normalized in ("", ".", "..") or normalized.startswith("../"):
+        return None
+    return normalized
+
+def _panel_file_path(pid, name):
+    """Return a safe (relative_name, absolute_path) pair."""
+    rel = _panel_relative_name(name)
+    if not rel:
+        return None, None
+    pdir = os.path.realpath(panel_dir(pid))
+    path = os.path.realpath(os.path.join(pdir, *rel.split("/")))
+    if path != pdir and not path.startswith(pdir + os.sep):
+        return None, None
+    return rel, path
+
+def _maybe_detect_start_command(pid, pdir):
+    """Auto-select the only root Python script when main.py is absent."""
+    with get_db() as db:
+        panel = db.execute("SELECT start_command FROM panels WHERE id=?", (pid,)).fetchone()
+    if not panel or (panel["start_command"] or "").strip() != "python main.py":
+        return None
+    if os.path.isfile(os.path.join(pdir, "main.py")):
+        return None
+    candidates = sorted(
+        name for name in os.listdir(pdir)
+        if name.lower().endswith(".py")
+        and os.path.isfile(os.path.join(pdir, name))
+        and name != "__init__.py"
+    )
+    if len(candidates) != 1:
+        return None
+    command = f"python {candidates[0]}"
+    with get_db() as db:
+        db.execute("UPDATE panels SET start_command=? WHERE id=?", (command, pid))
+        db.commit()
+    push_log(pid, f"[T10] Auto-selected startup command: {command}")
+    return command
+
 @app.route(BP + "/panel/upload", methods=["POST"])
 @login_required
 def upload_file():
@@ -513,71 +560,92 @@ def upload_file():
             _stream_pip(pid, req, pdir)
         threading.Thread(target=_bg_install, daemon=True).start()
         auto_msg = "Installing requirements.txt in background — watch the Console tab for progress."
-    return jsonify({"ok":True,"uploaded":uploaded,"errors":errors,"auto_install":auto_msg})
+    startup_command = _maybe_detect_start_command(pid, pdir)
+    return jsonify({"ok":True,"uploaded":uploaded,"errors":errors,
+                    "auto_install":auto_msg,"startup_command":startup_command})
 
 @app.route(BP + "/panel/files")
 @login_required
 def list_files():
     pdir = panel_dir(session["panel_id"]); files = []
-    for name in sorted(os.listdir(pdir)):
-        if name == ".requirements_installed": continue
-        fp = os.path.join(pdir, name)
-        if os.path.isfile(fp):
-            files.append({"name":name,"size":os.path.getsize(fp),
+    for root, _, names in os.walk(pdir):
+        for name in sorted(names):
+            fp = os.path.join(root, name)
+            rel = os.path.relpath(fp, pdir).replace(os.sep, "/")
+            if rel == ".requirements_installed" or not os.path.isfile(fp):
+                continue
+            files.append({"name":rel,"size":os.path.getsize(fp),
                           "modified":datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M")})
+    files.sort(key=lambda item: item["name"].lower())
     return jsonify({"files":files})
 
 @app.route(BP + "/panel/file/delete", methods=["POST"])
 @login_required
 def delete_file():
-    pdir = panel_dir(session["panel_id"])
+    pid = session["panel_id"]
     name = (request.json or {}).get("name","")
-    path = os.path.join(pdir, os.path.basename(name))
-    if os.path.isfile(path): os.remove(path); return jsonify({"ok":True})
+    rel, path = _panel_file_path(pid, name)
+    if not rel:
+        return jsonify({"ok":False,"msg":"Invalid file path"})
+    if os.path.isfile(path):
+        os.remove(path)
+        with get_db() as db:
+            db.execute("DELETE FROM shared_files WHERE panel_id=? AND filename=?", (pid, rel))
+            db.commit()
+        return jsonify({"ok":True})
     return jsonify({"ok":False,"msg":"Not found"})
 
 @app.route(BP + "/panel/file/view")
 @login_required
 def view_file():
-    pdir = panel_dir(session["panel_id"])
+    pid = session["panel_id"]
     name = request.args.get("name","")
-    path = os.path.join(pdir, os.path.basename(name))
-    if not os.path.isfile(path): return jsonify({"ok":False,"msg":"Not found"})
+    rel, path = _panel_file_path(pid, name)
+    if not rel or not os.path.isfile(path): return jsonify({"ok":False,"msg":"Not found"})
     try:
         with open(path,"r",errors="replace") as fh: content = fh.read(60000)
         return jsonify({"ok":True,"content":content})
     except Exception as e: return jsonify({"ok":False,"msg":str(e)})
 
+@app.route(BP + "/panel/file/download")
+@login_required
+def download_file():
+    pid = session["panel_id"]
+    rel, path = _panel_file_path(pid, request.args.get("name", ""))
+    if not rel or not os.path.isfile(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=os.path.basename(rel))
+
 @app.route(BP + "/panel/file/share", methods=["POST"])
 @login_required
 def share_file():
     pid  = session["panel_id"]
-    pdir = panel_dir(pid)
     name = (request.json or {}).get("name","")
-    base = os.path.basename(name)
-    path = os.path.join(pdir, base)
-    if not os.path.isfile(path):
+    rel, path = _panel_file_path(pid, name)
+    if not rel or not os.path.isfile(path):
         return jsonify({"ok":False,"msg":"File not found"})
     # Return existing token if already shared
     with get_db() as db:
         row = db.execute("SELECT token FROM shared_files WHERE panel_id=? AND filename=?",
-                         (pid, base)).fetchone()
+                         (pid, rel)).fetchone()
         if row:
             token = row["token"]
         else:
             token = secrets.token_urlsafe(24)
             db.execute("INSERT INTO shared_files (panel_id,filename,token,created_at) VALUES (?,?,?,?)",
-                       (pid, base, token, datetime.now().isoformat()))
+                       (pid, rel, token, datetime.now().isoformat()))
             db.commit()
     host = request.host_url.rstrip("/")
-    public_url = f"{host}{BP}/share/{token}/{base}"
+    public_url = f"{host}{BP}/share/{token}/{rel}"
     return jsonify({"ok":True,"url":public_url,"token":token})
 
 @app.route(BP + "/panel/file/unshare", methods=["POST"])
 @login_required
 def unshare_file():
     pid  = session["panel_id"]
-    name = os.path.basename((request.json or {}).get("name",""))
+    name, _ = _panel_file_path(pid, (request.json or {}).get("name",""))
+    if not name:
+        return jsonify({"ok":False,"msg":"Invalid file path"})
     with get_db() as db:
         db.execute("DELETE FROM shared_files WHERE panel_id=? AND filename=?", (pid, name))
         db.commit()
@@ -586,12 +654,13 @@ def unshare_file():
 # ── Public file serving (no auth required) ──────────────────────────────────
 @app.route(BP + "/share/<token>/<path:filename>")
 def public_share(token, filename):
+    requested_name = _panel_relative_name(filename)
     with get_db() as db:
         row = db.execute("SELECT panel_id, filename FROM shared_files WHERE token=?", (token,)).fetchone()
-    if not row or row["filename"] != os.path.basename(filename):
+    if not row or not requested_name or row["filename"] != requested_name:
         abort(404)
-    filepath = os.path.join(DATA_DIR, row["panel_id"], row["filename"])
-    if not os.path.isfile(filepath):
+    _, filepath = _panel_file_path(row["panel_id"], row["filename"])
+    if not filepath or not os.path.isfile(filepath):
         abort(404)
     mime, _ = mimetypes.guess_type(row["filename"])
     mime = mime or "application/octet-stream"
@@ -916,20 +985,24 @@ def admin_tgbots_add():
     data = request.get_json() or request.form
     token = (data.get("token") or "").strip()
     owner_admin_id = (data.get("owner_admin_id") or "").strip()
+    owner_admin_username = (data.get("owner_admin_username") or "").strip().lstrip("@")
     force_channel = (data.get("force_channel") or "").strip() or None
-    if not token or not owner_admin_id:
-        return jsonify({"ok": False, "msg": "Bot token and owner admin id both required"})
+    if not token or (not owner_admin_id and not owner_admin_username):
+        return jsonify({"ok": False, "msg": "Bot token and admin username or Telegram ID are required"})
     try:
         with get_db() as db:
             db.execute(
-                "INSERT INTO tg_bots (token, owner_admin_id, status, force_channel, created_at) VALUES (?,?,?,?,?)",
-                (token, owner_admin_id, "stopped", force_channel, datetime.now().isoformat()),
+                "INSERT INTO tg_bots (token, owner_admin_id, owner_admin_username, status, force_channel, created_at) VALUES (?,?,?,?,?,?)",
+                (token, owner_admin_id or "", owner_admin_username or None, "stopped", force_channel, datetime.now().isoformat()),
             )
             db.commit()
             row = db.execute("SELECT * FROM tg_bots WHERE token=?", (token,)).fetchone()
     except sqlite3.IntegrityError:
         return jsonify({"ok": False, "msg": "This bot token is already added"})
-    ok, msg = bot_engine.start_bot(row["id"], token, owner_admin_id, force_channel)
+    ok, msg = bot_engine.start_bot(
+        row["id"], token, owner_admin_id, force_channel,
+        owner_admin_username=row["owner_admin_username"],
+    )
     if not ok:
         with get_db() as db:
             db.execute("DELETE FROM tg_bots WHERE id=?", (row["id"],)); db.commit()
@@ -947,7 +1020,10 @@ def admin_tgbots_toggle():
     if bot_id in bot_engine.BOT_INSTANCES:
         bot_engine.stop_bot(bot_id)
         return jsonify({"ok": True, "status": "stopped"})
-    ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"], row["force_channel"])
+    ok, msg = bot_engine.start_bot(
+        bot_id, row["token"], row["owner_admin_id"], row["force_channel"],
+        owner_admin_username=row["owner_admin_username"],
+    )
     return jsonify({"ok": ok, "status": "running" if ok else "stopped", "msg": msg})
 
 @app.route(BP + "/admin/tgbots/setchannel", methods=["POST"])
@@ -963,7 +1039,10 @@ def admin_tgbots_setchannel():
         db.commit()
     if bot_id in bot_engine.BOT_INSTANCES:
         bot_engine.stop_bot(bot_id)
-        ok, msg = bot_engine.start_bot(bot_id, row["token"], row["owner_admin_id"], force_channel)
+        ok, msg = bot_engine.start_bot(
+            bot_id, row["token"], row["owner_admin_id"], force_channel,
+            owner_admin_username=row["owner_admin_username"],
+        )
         if not ok:
             return jsonify({"ok": False, "msg": msg})
     return jsonify({"ok": True})
