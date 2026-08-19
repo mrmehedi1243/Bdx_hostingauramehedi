@@ -254,6 +254,7 @@ pre  { font-family: 'Courier New', monospace; }
 }
 .btn-sm:hover  { opacity: .8; }
 .btn-view      { background: rgba(59,130,246,.15); color: var(--blue-l); border: 1px solid rgba(59,130,246,.25); }
+.btn-download  { background: rgba(168,85,247,.12); color: #c084fc; border: 1px solid rgba(168,85,247,.25); text-decoration: none; display: inline-block; }
 .btn-del       { background: rgba(239,68,68,.1); color: var(--red); border: 1px solid rgba(239,68,68,.25); }
 .btn-extend    { background: rgba(245,158,11,.1); color: var(--yellow); border: 1px solid rgba(245,158,11,.25); }
 .btn-share     { background: rgba(34,197,94,.1); color: var(--green); border: 1px solid rgba(34,197,94,.25); }

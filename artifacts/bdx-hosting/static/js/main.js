@@ -226,6 +226,7 @@ async function loadFiles() {
     tb.innerHTML = '<tr><td colspan="4" class="empty-td">No files uploaded yet.</td></tr>';
     return;
   }
+  const fileArg = name => encodeURIComponent(String(name)).replace(/'/g, "%27");
   tb.innerHTML = j.files.map(f => `
     <tr data-name="${esc(f.name)}">
       <td><i class="fa fa-file-code"></i> ${esc(f.name)}</td>
@@ -233,9 +234,9 @@ async function loadFiles() {
       <td>${esc(f.modified)}</td>
       <td>
         <a class="btn-sm btn-download" href="${BP}/panel/file/download?name=${encodeURIComponent(f.name)}" title="Download file"><i class="fa fa-download"></i></a>
-        <button class="btn-sm btn-view"  onclick="viewFile('${esc(f.name)}')"><i class="fa fa-eye"></i></button>
-        <button class="btn-sm btn-share" onclick="shareFile('${esc(f.name)}', this)" title="Get public URL"><i class="fa fa-link"></i></button>
-        <button class="btn-sm btn-del"   onclick="deleteFile('${esc(f.name)}')"><i class="fa fa-trash"></i></button>
+        <button class="btn-sm btn-view"  onclick="viewFile(decodeURIComponent('${fileArg(f.name)}'))"><i class="fa fa-eye"></i></button>
+        <button class="btn-sm btn-share" onclick="shareFile(decodeURIComponent('${fileArg(f.name)}'), this)" title="Get public URL"><i class="fa fa-link"></i></button>
+        <button class="btn-sm btn-del"   onclick="deleteFile(decodeURIComponent('${fileArg(f.name)}'))"><i class="fa fa-trash"></i></button>
       </td>
     </tr>`).join("");
 }
