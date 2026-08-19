@@ -180,7 +180,6 @@ async function handleCmd(e) {
   e.preventDefault();
   const inp = document.getElementById("cmd-input");
   const value = inp.value;
-  if (!value.trim()) return;
   inp.disabled = true;
   inp.value = "";
   const j = await post(BP + "/panel/input", {input: value});
