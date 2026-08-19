@@ -174,14 +174,22 @@ if (window.PANEL_STATUS === "running") {
   btn("btn-stop").disabled  = false;
 }
 
-/* ── Terminal input ──────────────────────────────────────────────── */
-function handleCmd(e) {
+/* ── Interactive script input ───────────────────────────────────── */
+async function handleCmd(e) {
   if (e.key !== "Enter") return;
+  e.preventDefault();
   const inp = document.getElementById("cmd-input");
-  const cmd = inp.value.trim();
-  if (!cmd) return;
-  appendLine("$ " + cmd);
+  const value = inp.value;
+  if (!value.trim()) return;
+  inp.disabled = true;
   inp.value = "";
+  const j = await post(BP + "/panel/input", {input: value});
+  if (!j.ok) {
+    appendLine("[ERROR] " + (j.msg || "Could not send input"));
+    inp.value = value;
+  }
+  inp.disabled = false;
+  inp.focus();
 }
 
 /* ── Tabs ────────────────────────────────────────────────────────── */

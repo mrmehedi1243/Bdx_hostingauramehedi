@@ -396,11 +396,17 @@ def _start(pid):
     try:
         proc = subprocess.Popen(
             cmd, shell=True, cwd=pdir, env=env,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         threading.Thread(target=stream_proc, args=(pid, proc), daemon=True).start()
-        PROCESSES[pid] = {"proc": proc, "start_time": time.time(), "port": app_port}
+        PROCESSES[pid] = {
+            "proc": proc,
+            "start_time": time.time(),
+            "port": app_port,
+            "stdin_lock": threading.Lock(),
+        }
         with get_db() as db:
             db.execute("UPDATE panels SET status='running' WHERE id=?", (pid,)); db.commit()
         return True, "Started"
@@ -436,6 +442,37 @@ def stop_panel():
         db.execute("UPDATE panels SET status='stopped' WHERE id=?", (pid,)); db.commit()
     push_log(pid, "[T10] Process stopped.")
     return jsonify({"ok":True})
+
+@app.route(BP + "/panel/input", methods=["POST"])
+@login_required
+def panel_input():
+    """Send one line of interactive input to the running hosted process."""
+    pid = session["panel_id"]
+    info = PROCESSES.get(pid)
+    if not info or not info.get("proc"):
+        return jsonify({"ok": False, "msg": "Panel process is not running"}), 409
+    proc = info["proc"]
+    if proc.poll() is not None or proc.stdin is None:
+        return jsonify({"ok": False, "msg": "The script is not accepting input"}), 409
+
+    data = request.get_json(silent=True) or {}
+    value = data.get("input", "")
+    if value is None:
+        value = ""
+    value = str(value)
+    if len(value) > 10000:
+        return jsonify({"ok": False, "msg": "Input is too long"}), 400
+    try:
+        # The browser sends one logical line; input() receives it after the
+        # newline. Serialize writes so two browser requests cannot interleave.
+        payload = (value + "\n").encode("utf-8")
+        with info.setdefault("stdin_lock", threading.Lock()):
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+        push_log(pid, "$ " + value)
+        return jsonify({"ok": True})
+    except (BrokenPipeError, OSError, ValueError) as exc:
+        return jsonify({"ok": False, "msg": f"Input stream closed: {exc}"}), 409
 
 @app.route(BP + "/panel/restart", methods=["POST"])
 @login_required

@@ -72,8 +72,9 @@
 </div>
     <div class="cmd-bar">
       <span class="cmd-prefix">$</span>
-      <input type="text" id="cmd-input" placeholder="Type command and press Enter..." onkeydown="handleCmd(event)">
+      <input type="text" id="cmd-input" autocomplete="off" placeholder="Type input for the running script and press Enter..." onkeydown="handleCmd(event)">
     </div>
+    <p class="startup-hint console-input-hint">Interactive input is sent directly to the running Python process. Use it for <code>input()</code> prompts and menu choices.</p>
     <!-- Stats grid -->
     <div class="stats-grid">
       <div class="stat-card yellow-border">
